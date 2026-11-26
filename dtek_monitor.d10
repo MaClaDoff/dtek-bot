@@ -1,0 +1,978 @@
+"""
+DTEK Dnipro Outage Monitor (Serverless / GitHub Actions)
+--------------------------------------------------------
+Моніторинг аварійних, екстрених та планових відключень (ГПВ)
+на сайті https://www.dtek-dnem.com.ua/ua/shutdowns
+зі сповіщеннями в Telegram (повністю українською мовою).
+
+Закладено архітектурний інтерфейс для майбутнього підключення
+розумної Wi-Fi розетки Tuya (відстеження фактичної наявності світла).
+"""
+
+from __future__ import annotations
+
+import html
+import json
+import logging
+import os
+import re
+import sys
+import time
+from dataclasses import dataclass, field
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Optional
+from zoneinfo import ZoneInfo
+
+import requests
+from playwright.sync_api import sync_playwright
+
+# ==============================================================================
+# 1. НАЛАШТУВАННЯ (підтягуються з GitHub Secrets або використовуються за замовчуванням)
+# ==============================================================================
+
+KYIV_TZ = ZoneInfo("Europe/Kyiv")
+
+DTEK_BASE_URL = "https://www.dtek-dnem.com.ua"
+DTEK_SHUTDOWNS_URL = f"{DTEK_BASE_URL}/ua/shutdowns"
+
+# Адреса за замовчуванням (за потреби можна перевизначити в GitHub Secrets,
+# щоб у публічному репозиторії ваша домашня адреса не була видна в коді)
+DTEK_CITY = os.getenv("DTEK_CITY", "м. Дніпро").strip()
+DTEK_STREET = os.getenv("DTEK_STREET", "пров. Добровольців").strip()
+DTEK_HOUSE = os.getenv("DTEK_HOUSE", "10").strip()
+
+# Telegram
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+# Тихі години (без звуку сповіщень): 23:00 — 07:00 за київським часом
+QUIET_HOURS_START = int(os.getenv("QUIET_HOURS_START", "23"))
+QUIET_HOURS_END = int(os.getenv("QUIET_HOURS_END", "7"))
+
+# Вікно попередження про планове відключення (хвилин до початку).
+# З урахуванням запуску раз на 15–20 хв, вікно [5..35] хв гарантує,
+# що попередження надійде рівно 1 раз за ~15–30 хв до відключення.
+PRE_OUTAGE_WARN_MIN_MINUTES = 5
+PRE_OUTAGE_WARN_MAX_MINUTES = 35
+
+# Файл збереження стану між запусками GitHub Actions
+STATE_FILE = Path(os.getenv("STATE_FILE", "state/state.json"))
+
+# Кількість повторних спроб при тимчасових збоях сайту ДТЕК / антибота
+MAX_FETCH_RETRIES = 3
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("dtek_monitor")
+
+
+# ==============================================================================
+# 2. ЗАДІЛ НА МАЙБУТНЄ: ПІДКЛЮЧЕННЯ РОЗУМНОЇ РОЗЕТКИ TUYA
+# ==============================================================================
+
+@dataclass
+class PhysicalPowerStatus:
+    """Фактичний стан електроенергії в квартирі (з розумної розетки)."""
+    enabled: bool = False
+    is_power_on: Optional[bool] = None
+    checked_at: Optional[str] = None
+    source: str = "Tuya Smart Plug"
+
+
+class TuyaPowerSensor:
+    """
+    Заготовка для майбутньої інтеграції з Tuya IoT Cloud API.
+    Поки ключі TUYA_* не додані в GitHub Secrets — модуль вимкнено
+    і він не виконує жодних запитів.
+
+    Коли купите Wi-Fi розетку Tuya:
+    1. Додайте бібліотеку `tinytuya` у requirements.txt.
+    2. Додайте в GitHub Secrets:
+       TUYA_API_REGION (eu), TUYA_ACCESS_ID, TUYA_ACCESS_SECRET, TUYA_DEVICE_ID.
+    3. Розкоментуйте блок запиту в методі `check_power()`.
+    """
+
+    def __init__(self) -> None:
+        self.access_id = os.getenv("TUYA_ACCESS_ID", "").strip()
+        self.access_secret = os.getenv("TUYA_ACCESS_SECRET", "").strip()
+        self.device_id = os.getenv("TUYA_DEVICE_ID", "").strip()
+        self.api_region = os.getenv("TUYA_API_REGION", "eu").strip()
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.access_id and self.access_secret and self.device_id)
+
+    def check_power(self) -> PhysicalPowerStatus:
+        if not self.is_configured:
+            return PhysicalPowerStatus(enabled=False)
+
+        # --- МАЙБУТНЯ РЕАЛІЗАЦІЯ (після купівлі розетки) ---
+        # import tinytuya
+        # cloud = tinytuya.Cloud(
+        #     apiRegion=self.api_region,
+        #     apiKey=self.access_id,
+        #     apiSecret=self.access_secret,
+        #     apiDeviceID=self.device_id,
+        # )
+        # info = cloud.getdevices(verbose=True)
+        # # Якщо розетка online у хмарі Tuya — світло є; якщо offline — світла немає
+        # is_online = ...
+        # return PhysicalPowerStatus(
+        #     enabled=True,
+        #     is_power_on=is_online,
+        #     checked_at=now_kyiv().strftime("%H:%M %d.%m.%Y"),
+        # )
+        logger.info("Tuya secrets знайдено, але інтеграція ще в режимі заглушки.")
+        return PhysicalPowerStatus(enabled=False)
+
+
+# ==============================================================================
+# 3. ДОПОМІЖНІ ФУНКЦІЇ ДАТИ/ЧАСУ ТА ФОРМАТУВАННЯ
+# ==============================================================================
+
+def now_kyiv() -> datetime:
+    return datetime.now(KYIV_TZ)
+
+
+def is_quiet_hours(dt: Optional[datetime] = None) -> bool:
+    """Перевіряє, чи зараз тихі години (23:00 — 07:00 за Києвом)."""
+    current = dt or now_kyiv()
+    hour = current.hour
+    if QUIET_HOURS_START > QUIET_HOURS_END:
+        return hour >= QUIET_HOURS_START or hour < QUIET_HOURS_END
+    return QUIET_HOURS_START <= hour < QUIET_HOURS_END
+
+
+def clean_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return re.sub(r"\s+", " ", str(value)).strip()
+
+
+def parse_dtek_datetime(raw: str) -> Optional[datetime]:
+    """
+    Парсить формати дати ДТЕК, наприклад:
+      - '14:10 26.11.2026'
+      - 'до 14:10 26.11.2026'
+      - '26.11.2026 14:10'
+    """
+    text = clean_text(raw)
+    if not text:
+        return None
+    text = re.sub(r"^до\s+", "", text, flags=re.IGNORECASE).strip()
+
+    for fmt in ("%H:%M %d.%m.%Y", "%d.%m.%Y %H:%M", "%H:%M %d.%m.%y", "%d.%m.%y %H:%M"):
+        try:
+            dt = datetime.strptime(text, fmt)
+            return dt.replace(tzinfo=KYIV_TZ)
+        except ValueError:
+            continue
+    return None
+
+
+def format_time_delta_ua(old_dt: datetime, new_dt: datetime) -> str:
+    """Форматує різницю між часами у зрозумілий вигляд: '+3 год 50 хв' або '-45 хв'."""
+    diff_seconds = int((new_dt - old_dt).total_seconds())
+    if diff_seconds == 0:
+        return "без змін"
+
+    sign = "+" if diff_seconds > 0 else "-"
+    total_minutes = abs(diff_seconds) // 60
+    days, rem = divmod(total_minutes, 24 * 60)
+    hours, minutes = divmod(rem, 60)
+
+    parts: list[str] = []
+    if days:
+        parts.append(f"{days} дн")
+    if hours:
+        parts.append(f"{hours} год")
+    if minutes or not parts:
+        parts.append(f"{minutes} хв")
+
+    return f"{sign}{' '.join(parts)}"
+
+
+def normalize_end_date_display(raw: str) -> str:
+    """Прибирає дублювання 'до ', щоб красиво форматувати час відновлення."""
+    text = clean_text(raw)
+    return re.sub(r"^до\s+", "", text, flags=re.IGNORECASE).strip()
+
+
+# ==============================================================================
+# 4. МОДЕЛІ ДАНИХ ТА ПАРСИНГ ГРАФІКІВ ГПВ
+# ==============================================================================
+
+@dataclass
+class OutageBanner:
+    """Дані з жовтої інформаційної картки будинку (як на Фото 1)."""
+    active: bool = False
+    reason: str = ""
+    start_date: str = ""
+    end_date: str = ""
+    outage_type: str = ""  # '1' = планове/стабілізаційне, '2' = аварійне/екстрене тощо
+    update_timestamp: str = ""
+
+    @property
+    def is_emergency(self) -> bool:
+        r_low = self.reason.lower()
+        return (
+            self.outage_type == "2"
+            or "аварійн" in r_low
+            or "екстре" in r_low
+            or "ремонтн" in r_low
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "active": self.active,
+            "reason": self.reason,
+            "start_date": self.start_date,
+            "end_date": self.end_date,
+            "outage_type": self.outage_type,
+            "update_timestamp": self.update_timestamp,
+        }
+
+
+@dataclass
+class DaySchedule:
+    """Плановий графік відключень (ГПВ) на конкретну дату."""
+    date_iso: str           # '2026-11-26'
+    date_label: str         # '26.11.2026'
+    intervals: list[list[str]] = field(default_factory=list)   # [['08:00', '11:30'], ...]
+    possible_intervals: list[list[str]] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "date_iso": self.date_iso,
+            "date_label": self.date_label,
+            "intervals": self.intervals,
+            "possible_intervals": self.possible_intervals,
+        }
+
+
+@dataclass
+class DtekSnapshot:
+    """Повний знімок даних із сайту ДТЕК для нашої адреси."""
+    group_id: str = ""
+    banner: OutageBanner = field(default_factory=OutageBanner)
+    schedules: dict[str, DaySchedule] = field(default_factory=dict)  # date_iso -> DaySchedule
+    fact_update: str = ""
+
+
+def _minutes_to_hhmm(total_minutes: int) -> str:
+    h, m = divmod(total_minutes, 60)
+    return f"{h:02d}:{m:02d}"
+
+
+def _extract_intervals_from_flags(half_hour_flags: list[bool]) -> list[list[str]]:
+    """Об'єднує сусідні 30-хвилинні слоти відключень у діапазони ['HH:MM', 'HH:MM']."""
+    intervals: list[list[str]] = []
+    start_idx: Optional[int] = None
+
+    for idx, is_off in enumerate(half_hour_flags):
+        if is_off and start_idx is None:
+            start_idx = idx
+        elif not is_off and start_idx is not None:
+            intervals.append([_minutes_to_hhmm(start_idx * 30), _minutes_to_hhmm(idx * 30)])
+            start_idx = None
+
+    if start_idx is not None:
+        intervals.append([_minutes_to_hhmm(start_idx * 30), "24:00"])
+
+    return intervals
+
+
+def parse_group_slots(slots: dict[str, str]) -> tuple[list[list[str]], list[list[str]]]:
+    """
+    Розбирає 24 годинні слоти ДТЕК ('1'..'24'):
+      yes     -> світло є всю годину
+      no      -> світла немає всю годину
+      first   -> немає у першій половині (00–30 хв)
+      second  -> немає у другій половині (30–60 хв)
+      maybe   -> можливе відключення всю годину
+      mfirst  -> можливе у першій половині
+      msecond -> можливе у другій половині
+    """
+    definite_off = [False] * 48
+    possible_off = [False] * 48
+
+    for hour_num in range(1, 25):
+        val = str(slots.get(str(hour_num), "yes")).strip().lower()
+        base = (hour_num - 1) * 2
+        if val == "no":
+            definite_off[base] = True
+            definite_off[base + 1] = True
+        elif val == "first":
+            definite_off[base] = True
+        elif val == "second":
+            definite_off[base + 1] = True
+        elif val == "maybe":
+            possible_off[base] = True
+            possible_off[base + 1] = True
+        elif val == "mfirst":
+            possible_off[base] = True
+        elif val == "msecond":
+            possible_off[base + 1] = True
+
+    return (
+        _extract_intervals_from_flags(definite_off),
+        _extract_intervals_from_flags(possible_off),
+    )
+
+
+def extract_schedules_from_fact(
+    fact_obj: dict[str, Any],
+    group_id: str,
+) -> dict[str, DaySchedule]:
+    """Витягує підтверджені графіки на сьогодні та завтра для нашої черги (групи)."""
+    result: dict[str, DaySchedule] = {}
+    if not fact_obj or not isinstance(fact_obj, dict) or not group_id:
+        return result
+
+    fact_data = fact_obj.get("data")
+    if not isinstance(fact_data, dict):
+        return result
+
+    today_date = now_kyiv().date()
+    tomorrow_date = today_date + timedelta(days=1)
+
+    # Формуємо можливі варіанти ключа групи (наприклад, 'GPV3.1' або '3.1')
+    candidate_keys = [group_id]
+    if group_id.startswith("GPV"):
+        candidate_keys.append(group_id.replace("GPV", "", 1))
+    else:
+        candidate_keys.append(f"GPV{group_id}")
+
+    for ts_key, groups_map in fact_data.items():
+        if not isinstance(groups_map, dict):
+            continue
+        try:
+            day_dt = datetime.fromtimestamp(int(ts_key), tz=KYIV_TZ)
+        except (ValueError, TypeError, OSError):
+            continue
+
+        day_date = day_dt.date()
+        if day_date not in (today_date, tomorrow_date):
+            continue
+
+        group_slots = None
+        for key in candidate_keys:
+            if key in groups_map and isinstance(groups_map[key], dict):
+                group_slots = groups_map[key]
+                break
+
+        if not group_slots:
+            continue
+
+        definite, possible = parse_group_slots(group_slots)
+        date_iso = day_date.isoformat()
+        result[date_iso] = DaySchedule(
+            date_iso=date_iso,
+            date_label=day_date.strftime("%d.%m.%Y"),
+            intervals=definite,
+            possible_intervals=possible,
+        )
+
+    return result
+
+
+# ==============================================================================
+# 5. ОТРИМАННЯ ДАНИХ ІЗ САЙТУ ДТЕК ЧЕРЕЗ PLAYWRIGHT (ОБХІД IMPERVA/INCAPSULA)
+# ==============================================================================
+
+def _find_house_entry(houses_map: dict[str, Any], target_house: str) -> Optional[dict[str, Any]]:
+    """Шукає запис нашого будинку в JSON-відповіді getHomeNum."""
+    if not isinstance(houses_map, dict):
+        return None
+
+    # 1. Точний збіг
+    if target_house in houses_map and isinstance(houses_map[target_house], dict):
+        return houses_map[target_house]
+
+    # 2. Збіг без урахування регістру та зайвих пробілів
+    norm_target = clean_text(target_house).lower()
+    for key, value in houses_map.items():
+        if clean_text(key).lower() == norm_target and isinstance(value, dict):
+            return value
+
+    return None
+
+
+def fetch_dtek_snapshot() -> Optional[DtekSnapshot]:
+    """
+    Відкриває сайт ДТЕК у headless Chromium, проходить антибот-перевірку Imperva,
+    виконує нативний AJAX-запит getHomeNum всередині контексту браузера
+    та зчитує window.DisconSchedule.
+    """
+    for attempt in range(1, MAX_FETCH_RETRIES + 1):
+        logger.info("Спроба %d/%d: завантаження %s ...", attempt, MAX_FETCH_RETRIES, DTEK_SHUTDOWNS_URL)
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(
+                    headless=True,
+                    args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-sandbox",
+                        "--disable-dev-shm-usage",
+                    ],
+                )
+                context = browser.new_context(
+                    locale="uk-UA",
+                    timezone_id="Europe/Kyiv",
+                    viewport={"width": 1366, "height": 900},
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/131.0.0.0 Safari/537.36"
+                    ),
+                )
+                page = context.new_page()
+
+                # Маскуємо ознаки автоматизації для WAF Imperva
+                page.add_init_script(
+                    "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+                )
+
+                page.goto(DTEK_SHUTDOWNS_URL, wait_until="domcontentloaded", timeout=60_000)
+
+                # Чекаємо проходження JS-перевірки Imperva та появи об'єкта DisconSchedule або форми
+                page.wait_for_function(
+                    """() => {
+                        return Boolean(window.DisconSchedule) ||
+                               Boolean(document.querySelector('meta[name="csrf-token"]')) ||
+                               Boolean(document.querySelector('#city'));
+                    }""",
+                    timeout=45_000,
+                )
+                # Невелика пауза для завершення ініціалізації cookies
+                page.wait_for_timeout(2000)
+
+                # Виконуємо AJAX-запит getHomeNum прямо з контексту сторінки
+                raw_payload = page.evaluate(
+                    """async ({ city, street }) => {
+                        const csrfMeta = document.querySelector('meta[name="csrf-token"]');
+                        const ajaxMeta = document.querySelector('meta[name="ajaxUrl"]');
+                        const csrfToken = csrfMeta ? csrfMeta.getAttribute('content') : '';
+                        const ajaxUrl = ajaxMeta ? ajaxMeta.getAttribute('content') : '/ua/ajax';
+
+                        const ds = window.DisconSchedule || {};
+                        const updateFact = (ds.fact && ds.fact.update) ? ds.fact.update : '';
+
+                        const params = new URLSearchParams();
+                        params.append('method', 'getHomeNum');
+                        params.append('data[0][name]', 'city');
+                        params.append('data[0][value]', city);
+                        params.append('data[1][name]', 'street');
+                        params.append('data[1][value]', street);
+                        params.append('data[2][name]', 'updateFact');
+                        params.append('data[2][value]', updateFact);
+
+                        const headers = {
+                            'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
+                            'X-Requested-With': 'XMLHttpRequest',
+                            'Accept': 'application/json, text/javascript, */*; q=0.01',
+                        };
+                        if (csrfToken) {
+                            headers['X-CSRF-Token'] = csrfToken;
+                        }
+
+                        const resp = await fetch(ajaxUrl, {
+                            method: 'POST',
+                            headers,
+                            body: params.toString(),
+                            credentials: 'same-origin',
+                        });
+
+                        const text = await resp.text();
+                        let ajaxJson = null;
+                        try {
+                            ajaxJson = JSON.parse(text);
+                        } catch (e) {
+                            ajaxJson = { parse_error: true, status: resp.status, snippet: text.slice(0, 200) };
+                        }
+
+                        return {
+                            ajax: ajaxJson,
+                            fact: ds.fact || null,
+                        };
+                    }""",
+                    {"city": DTEK_CITY, "street": DTEK_STREET},
+                )
+
+                browser.close()
+
+            ajax_resp = raw_payload.get("ajax") or {}
+            page_fact = raw_payload.get("fact") or {}
+
+            if not isinstance(ajax_resp, dict) or not ajax_resp.get("result"):
+                logger.warning("Некоректна відповідь getHomeNum: %s", str(ajax_resp)[:250])
+                time.sleep(5)
+                continue
+
+            houses_data = ajax_resp.get("data") or {}
+            house_entry = _find_house_entry(houses_data, DTEK_HOUSE)
+            if house_entry is None:
+                logger.warning(
+                    "Будинок '%s' не знайдено серед повернутих (%d шт.). Перевірте точність адреси.",
+                    DTEK_HOUSE,
+                    len(houses_data) if isinstance(houses_data, dict) else 0,
+                )
+                return None
+
+            # 1. Розбираємо інформацію про поточне відключення (жовта картка, Фото 1)
+            sub_type = clean_text(house_entry.get("sub_type"))
+            start_date = clean_text(house_entry.get("start_date"))
+            end_date = normalize_end_date_display(house_entry.get("end_date"))
+            outage_type = clean_text(house_entry.get("type"))
+            update_ts = clean_text(
+                ajax_resp.get("updateTimestamp")
+                or (ajax_resp.get("fact") or {}).get("update")
+                or page_fact.get("update")
+            )
+
+            is_active = bool(sub_type or start_date or end_date)
+            banner = OutageBanner(
+                active=is_active,
+                reason=sub_type or "Відсутня електроенергія",
+                start_date=start_date,
+                end_date=end_date,
+                outage_type=outage_type,
+                update_timestamp=update_ts,
+            )
+
+            # 2. Визначаємо чергу (групу) будинку для планових графіків ГПВ
+            reasons_list = house_entry.get("sub_type_reason") or []
+            group_id = ""
+            if isinstance(reasons_list, list) and reasons_list:
+                group_id = clean_text(reasons_list[0])
+            elif isinstance(reasons_list, str):
+                group_id = clean_text(reasons_list)
+
+            # 3. Розбираємо планові графіки (ГПВ) на сьогодні та завтра
+            fact_obj = ajax_resp.get("fact") if isinstance(ajax_resp.get("fact"), dict) else page_fact
+            schedules = extract_schedules_from_fact(fact_obj or {}, group_id)
+            fact_update = clean_text((fact_obj or {}).get("update") or update_ts)
+
+            logger.info(
+                "Успішно отримано дані: active=%s, group=%s, schedules=%s",
+                banner.active,
+                group_id or "не визначено",
+                list(schedules.keys()),
+            )
+            return DtekSnapshot(
+                group_id=group_id,
+                banner=banner,
+                schedules=schedules,
+                fact_update=fact_update,
+            )
+
+        except Exception as exc:
+            logger.warning("Помилка на спробі %d/%d: %s", attempt, MAX_FETCH_RETRIES, exc)
+            if attempt < MAX_FETCH_RETRIES:
+                time.sleep(5)
+
+    return None
+
+
+# ==============================================================================
+# 6. РОБОТА ЗІ СТАНОМ (STATE.JSON) ТА TELEGRAM
+# ==============================================================================
+
+def load_state() -> dict[str, Any]:
+    if not STATE_FILE.exists():
+        return {}
+    try:
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Не вдалося прочитати state.json, починаємо з чистого стану: %s", exc)
+        return {}
+
+
+def save_state(state: dict[str, Any]) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def send_telegram_message(text: str) -> bool:
+    """Надсилає повідомлення в Telegram з урахуванням тихих годин (23:00–07:00)."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        logger.error("Не задано TELEGRAM_BOT_TOKEN або TELEGRAM_CHAT_ID!")
+        return False
+
+    silent = is_quiet_hours()
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": text,
+        "parse_mode": "HTML",
+        "disable_web_page_preview": True,
+        "disable_notification": silent,
+    }
+
+    for attempt in range(1, 4):
+        try:
+            resp = requests.post(url, json=payload, timeout=20)
+            if resp.ok:
+                logger.info("Повідомлення надіслано в Telegram (тихий режим: %s).", silent)
+                return True
+            logger.warning("Telegram API повернув %d: %s", resp.status_code, resp.text[:200])
+        except Exception as exc:
+            logger.warning("Помилка відправки в Telegram (спроба %d): %s", attempt, exc)
+        time.sleep(3)
+
+    return False
+
+
+# ==============================================================================
+# 7. ФОРМУВАННЯ ПОВІДОМЛЕНЬ (УКРАЇНСЬКОЮ) ТА РОЗУМНЕ ПОРІВНЯННЯ ЗМІН
+# ==============================================================================
+
+def format_address_line() -> str:
+    return f"📍 <b>{html.escape(DTEK_CITY)}, {html.escape(DTEK_STREET)}, буд. {html.escape(DTEK_HOUSE)}</b>"
+
+
+def format_group_pretty(group_id: str) -> str:
+    if not group_id:
+        return ""
+    cleaned = group_id.replace("GPV", "")
+    return f"Черга {cleaned}"
+
+
+def build_banner_new_message(banner: OutageBanner) -> str:
+    if banner.is_emergency:
+        header = "🚨 <b>За вашою адресою відсутня електроенергія!</b>"
+    else:
+        header = "⚡️ <b>Зафіксовано відключення електроенергії</b>"
+
+    lines = [header, format_address_line(), ""]
+    if banner.reason:
+        lines.append(f"⚠️ Причина: <b>{html.escape(banner.reason)}</b>")
+    if banner.start_date:
+        lines.append(f"🕒 Час початку: <b>{html.escape(banner.start_date)}</b>")
+    if banner.end_date:
+        lines.append(f"🔌 Орієнтовне відновлення: <b>до {html.escape(banner.end_date)}</b>")
+    if banner.update_timestamp:
+        lines.append("")
+        lines.append(f"<i>📢 Оновлено на сайті ДТЕК: {html.escape(banner.update_timestamp)}</i>")
+
+    return "\n".join(lines)
+
+
+def build_banner_changed_message(
+    prev: dict[str, Any],
+    curr: OutageBanner,
+    end_history: list[str],
+) -> str:
+    lines = [
+        "🔄 <b>Оновлення інформації про відключення!</b>",
+        format_address_line(),
+        "",
+    ]
+
+    prev_reason = clean_text(prev.get("reason"))
+    if prev_reason and curr.reason and prev_reason != curr.reason:
+        lines.append(
+            f"⚠️ Причина змінилась:\n"
+            f"<s>{html.escape(prev_reason)}</s> → <b>{html.escape(curr.reason)}</b>"
+        )
+    elif curr.reason:
+        lines.append(f"⚠️ Причина: <b>{html.escape(curr.reason)}</b>")
+
+    if curr.start_date:
+        lines.append(f"🕒 Час початку: <b>{html.escape(curr.start_date)}</b>")
+
+    prev_end = clean_text(prev.get("end_date"))
+    if prev_end != curr.end_date:
+        old_dt = parse_dtek_datetime(prev_end)
+        new_dt = parse_dtek_datetime(curr.end_date)
+        delta_str = ""
+        if old_dt and new_dt:
+            delta_str = f" (<b>{format_time_delta_ua(old_dt, new_dt)}</b>)"
+
+        shift_num = max(1, len(end_history) - 1)
+        if prev_end and curr.end_date:
+            lines.append(
+                f"⏳ Час відновлення перенесено (#{shift_num}):\n"
+                f"<s>до {html.escape(prev_end)}</s> → <b>до {html.escape(curr.end_date)}</b>{delta_str}"
+            )
+        elif curr.end_date:
+            lines.append(f"🔌 Орієнтовне відновлення: <b>до {html.escape(curr.end_date)}</b>")
+
+        # Якщо перенесень більше одного, показуємо коротку історію
+        if len(end_history) >= 3:
+            chain = " → ".join(html.escape(x) for x in end_history[-4:])
+            lines.append(f"<i>📜 Історія перенесень: {chain}</i>")
+    elif curr.end_date:
+        lines.append(f"🔌 Орієнтовне відновлення: <b>до {html.escape(curr.end_date)}</b>")
+
+    if curr.update_timestamp:
+        lines.append("")
+        lines.append(f"<i>📢 Оновлено на сайті ДТЕК: {html.escape(curr.update_timestamp)}</i>")
+
+    return "\n".join(lines)
+
+
+def build_banner_resolved_message(prev: dict[str, Any], update_ts: str) -> str:
+    lines = [
+        "✅ <b>Інформацію про відключення знято!</b>",
+        format_address_line(),
+        "",
+        "На сайті ДТЕК більше немає активного повідомлення про відсутність світла.",
+    ]
+    prev_reason = clean_text(prev.get("reason"))
+    if prev_reason:
+        lines.append(f"<i>Попередня причина: {html.escape(prev_reason)}</i>")
+    if update_ts:
+        lines.append(f"<i>📢 Оновлено на сайті ДТЕК: {html.escape(update_ts)}</i>")
+    return "\n".join(lines)
+
+
+def format_day_schedule_block(title: str, day: DaySchedule) -> str:
+    lines = [f"{title} (<b>{day.date_label}</b>):"]
+    if not day.intervals and not day.possible_intervals:
+        lines.append("🟢 <b>Відключень не заплановано</b> (00:00 — 24:00)")
+    else:
+        for start, end in day.intervals:
+            lines.append(f"🪫 <b>{start} — {end}</b>")
+        for start, end in day.possible_intervals:
+            lines.append(f"🟡 {start} — {end} <i>(можливе відключення)</i>")
+    return "\n".join(lines)
+
+
+def build_schedule_update_message(
+    snapshot: DtekSnapshot,
+    changed_dates: list[str],
+    is_initial: bool,
+) -> str:
+    today_iso = now_kyiv().date().isoformat()
+    tomorrow_iso = (now_kyiv().date() + timedelta(days=1)).isoformat()
+
+    if is_initial:
+        header = "📅 <b>Актуальний графік відключень (ГПВ)</b>"
+    elif changed_dates == [tomorrow_iso]:
+        header = "🔮 <b>З'явився або оновився графік на завтра!</b>"
+    else:
+        header = "📅 <b>Оновився графік планових відключень (ГПВ)!</b>"
+
+    group_label = format_group_pretty(snapshot.group_id)
+    lines = [header, format_address_line()]
+    if group_label:
+        lines.append(f"🔢 <b>{html.escape(group_label)}</b>")
+    lines.append("")
+
+    if today_iso in snapshot.schedules:
+        lines.append(format_day_schedule_block("⚡️ Сьогодні", snapshot.schedules[today_iso]))
+    if tomorrow_iso in snapshot.schedules:
+        if today_iso in snapshot.schedules:
+            lines.append("")
+        lines.append(format_day_schedule_block("🔮 Завтра", snapshot.schedules[tomorrow_iso]))
+
+    if snapshot.fact_update:
+        lines.append("")
+        lines.append(f"<i>📢 Графік оновлено: {html.escape(snapshot.fact_update)}</i>")
+
+    return "\n".join(lines)
+
+
+def check_pre_outage_warning(
+    snapshot: DtekSnapshot,
+    state: dict[str, Any],
+) -> Optional[str]:
+    """
+    Перевіряє, чи починається планове відключення через 5–35 хвилин.
+    Надсилає попередження рівно 1 раз на кожен інтервал.
+    """
+    # Якщо зараз вже триває активне відключення за карткою ДТЕК — не дублюємо попередження
+    if snapshot.banner.active:
+        return None
+
+    now = now_kyiv()
+    today_iso = now.date().isoformat()
+    tomorrow_iso = (now.date() + timedelta(days=1)).isoformat()
+
+    notified: list[str] = state.get("notified_warnings", [])
+    # Прибираємо старі записи (залишаємо лише сьогодні/завтра)
+    notified = [k for k in notified if k.startswith(today_iso) or k.startswith(tomorrow_iso)]
+    state["notified_warnings"] = notified
+
+    for date_iso in (today_iso, tomorrow_iso):
+        day_sched = snapshot.schedules.get(date_iso)
+        if not day_sched:
+            continue
+
+        base_date = datetime.strptime(date_iso, "%Y-%m-%d").date()
+
+        for start_str, end_str in day_sched.intervals:
+            warn_key = f"{date_iso} {start_str}"
+            if warn_key in notified:
+                continue
+
+            h, m = map(int, start_str.split(":"))
+            start_dt = datetime(
+                base_date.year, base_date.month, base_date.day, h, m, tzinfo=KYIV_TZ
+            )
+            minutes_until = int((start_dt - now).total_seconds() // 60)
+
+            if PRE_OUTAGE_WARN_MIN_MINUTES <= minutes_until <= PRE_OUTAGE_WARN_MAX_MINUTES:
+                notified.append(warn_key)
+                state["notified_warnings"] = notified
+                return (
+                    f"⏳ <b>Попередження: скоро планове відключення!</b>\n"
+                    f"{format_address_line()}\n\n"
+                    f"Через <b>~{minutes_until} хв</b> (о <b>{start_str}</b>) очікується вимкнення світла за графіком.\n"
+                    f"🪫 Період: <b>{start_str} — {end_str}</b>\n\n"
+                    f"<i>💡 Встигніть зарядити пристрої та зберегти важливу роботу.</i>"
+                )
+
+    return None
+
+
+# ==============================================================================
+# 8. ГОЛОВНИЙ ЦИКЛ ПЕРЕВІРКИ
+# ==============================================================================
+
+def main() -> int:
+    logger.info("Запуск перевірки ДТЕК для: %s, %s, буд. %s", DTEK_CITY, DTEK_STREET, DTEK_HOUSE)
+
+    state = load_state()
+    is_first_run = not bool(state)
+
+    # 1. Опціональна перевірка фізичної розетки Tuya (на майбутнє)
+    tuya_sensor = TuyaPowerSensor()
+    physical_status = tuya_sensor.check_power()
+    if physical_status.enabled:
+        prev_power = state.get("tuya_power_on")
+        if prev_power is not None and prev_power != physical_status.is_power_on:
+            if physical_status.is_power_on:
+                send_telegram_message(
+                    f"🟢 <b>Світло фактично з'явилось!</b> (за даними розетки Tuya)\n"
+                    f"{format_address_line()}\n🕒 {physical_status.checked_at}"
+                )
+            else:
+                send_telegram_message(
+                    f"🔴 <b>Світло фактично зникло!</b> (за даними розетки Tuya)\n"
+                    f"{format_address_line()}\n🕒 {physical_status.checked_at}\n"
+                    f"<i>Перевіряю інформацію на сайті ДТЕК...</i>"
+                )
+        state["tuya_power_on"] = physical_status.is_power_on
+
+    # 2. Завантаження актуальних даних із сайту ДТЕК
+    snapshot = fetch_dtek_snapshot()
+    if snapshot is None:
+        # Вимога 13-а: якщо сайт тимчасово не відповідає або спрацював антибот —
+        # тихо завершуємо цикл без спаму помилками і пробуємо в наступний запуск.
+        logger.warning("Не вдалося отримати дані з ДТЕК у цьому циклі. Тихо спробуємо наступного разу.")
+        return 0
+
+    messages_to_send: list[str] = []
+
+    # ------------------------------------------------------------------
+    # 3. Перевірка картки поточного/аварійного відключення (Фото 1)
+    # ------------------------------------------------------------------
+    prev_banner: dict[str, Any] = state.get("banner") or {}
+    prev_active = bool(prev_banner.get("active", False))
+    curr_banner = snapshot.banner
+    end_history: list[str] = state.get("end_date_history", [])
+
+    if curr_banner.active and not prev_active:
+        # Нове відключення
+        end_history = [curr_banner.end_date] if curr_banner.end_date else []
+        messages_to_send.append(build_banner_new_message(curr_banner))
+
+    elif curr_banner.active and prev_active:
+        # Порівнюємо ТІЛЬКИ суттєві поля (ігноруємо зміну самої лише 'Дата оновлення інформації' — вимога 4-а!)
+        meaningful_changed = (
+            clean_text(prev_banner.get("reason")) != curr_banner.reason
+            or clean_text(prev_banner.get("start_date")) != curr_banner.start_date
+            or clean_text(prev_banner.get("end_date")) != curr_banner.end_date
+        )
+        if meaningful_changed:
+            if curr_banner.end_date and (not end_history or end_history[-1] != curr_banner.end_date):
+                end_history.append(curr_banner.end_date)
+            messages_to_send.append(
+                build_banner_changed_message(prev_banner, curr_banner, end_history)
+            )
+        else:
+            logger.info("Картка відключення не змінилась (лише дата оновлення або без змін) — не турбуємо.")
+
+    elif not curr_banner.active and prev_active:
+        # Відключення завершилося / картку прибрали
+        messages_to_send.append(
+            build_banner_resolved_message(prev_banner, curr_banner.update_timestamp)
+        )
+        end_history = []
+
+    # Оновлюємо збережений стан картки
+    state["banner"] = curr_banner.to_dict()
+    state["end_date_history"] = end_history
+    if snapshot.group_id:
+        state["group_id"] = snapshot.group_id
+
+    # ------------------------------------------------------------------
+    # 4. Перевірка планових графіків ГПВ (сьогодні / завтра)
+    # ------------------------------------------------------------------
+    prev_schedules: dict[str, Any] = state.get("schedules") or {}
+    changed_dates: list[str] = []
+
+    for date_iso, day_sched in snapshot.schedules.items():
+        prev_day = prev_schedules.get(date_iso) or {}
+        if (
+            prev_day.get("intervals") != day_sched.intervals
+            or prev_day.get("possible_intervals") != day_sched.possible_intervals
+        ):
+            changed_dates.append(date_iso)
+
+    if changed_dates:
+        messages_to_send.append(
+            build_schedule_update_message(
+                snapshot=snapshot,
+                changed_dates=changed_dates,
+                is_initial=is_first_run,
+            )
+        )
+
+    # Зберігаємо лише актуальні дати (сьогодні та завтра), щоб state.json не розростався
+    state["schedules"] = {k: v.to_dict() for k, v in snapshot.schedules.items()}
+
+    # ------------------------------------------------------------------
+    # 5. Попередження за 15–30 хв до початку планового відключення
+    # ------------------------------------------------------------------
+    warning_msg = check_pre_outage_warning(snapshot, state)
+    if warning_msg:
+        messages_to_send.append(warning_msg)
+
+    # ------------------------------------------------------------------
+    # 6. Вітальне повідомлення при самому першому запуску (якщо змін не було)
+    # ------------------------------------------------------------------
+    if is_first_run and not messages_to_send:
+        group_label = format_group_pretty(snapshot.group_id)
+        group_part = f"\n🔢 Визначена черга: <b>{html.escape(group_label)}</b>" if group_label else ""
+        messages_to_send.append(
+            f"🤖 <b>Моніторинг ДТЕК успішно підключено!</b>\n"
+            f"{format_address_line()}{group_part}\n\n"
+            f"🟢 На даний момент активних відключень на сайті ДТЕК немає.\n"
+            f"<i>Я повідомлю вас одразу, щойно з'явиться аварія, зміниться графік або наблизиться планове вимкнення.</i>"
+        )
+
+    # ------------------------------------------------------------------
+    # 7. Відправка повідомлень та збереження стану
+    # ------------------------------------------------------------------
+    state["last_successful_check"] = now_kyiv().isoformat()
+
+    for msg in messages_to_send:
+        send_telegram_message(msg)
+
+    save_state(state)
+    logger.info("Перевірку завершено. Надіслано повідомлень: %d.", len(messages_to_send))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
