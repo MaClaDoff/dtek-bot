@@ -36,28 +36,25 @@ KYIV_TZ = ZoneInfo("Europe/Kyiv")
 DTEK_BASE_URL = "https://www.dtek-dnem.com.ua"
 DTEK_SHUTDOWNS_URL = f"{DTEK_BASE_URL}/ua/shutdowns"
 
-# Адреса за замовчуванням (за потреби можна перевизначити в GitHub Secrets,
-# щоб у публічному репозиторії ваша домашня адреса не була видна в коді)
-DTEK_CITY = os.getenv("DTEK_CITY", "м. Дніпро").strip()
-DTEK_STREET = os.getenv("DTEK_STREET", "пров. Добровольців").strip()
-DTEK_HOUSE = os.getenv("DTEK_HOUSE", "10").strip()
+# Адреса за замовчуванням (за потреби можна перевизначити в GitHub Secrets)
+DTEK_CITY = (os.getenv("DTEK_CITY") or "м. Дніпро").strip()
+DTEK_STREET = (os.getenv("DTEK_STREET") or "пров. Добровольців").strip()
+DTEK_HOUSE = (os.getenv("DTEK_HOUSE") or "10").strip()
 
 # Telegram
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
+TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 
 # Тихі години (без звуку сповіщень): 23:00 — 07:00 за київським часом
-QUIET_HOURS_START = int(os.getenv("QUIET_HOURS_START", "23"))
-QUIET_HOURS_END = int(os.getenv("QUIET_HOURS_END", "7"))
+QUIET_HOURS_START = int(os.getenv("QUIET_HOURS_START") or "23")
+QUIET_HOURS_END = int(os.getenv("QUIET_HOURS_END") or "7")
 
-# Вікно попередження про планове відключення (хвилин до початку).
-# З урахуванням запуску раз на 15–20 хв, вікно [5..35] хв гарантує,
-# що попередження надійде рівно 1 раз за ~15–30 хв до відключення.
+# Вікно попередження про планове відключення (хвилин до початку)
 PRE_OUTAGE_WARN_MIN_MINUTES = 5
 PRE_OUTAGE_WARN_MAX_MINUTES = 35
 
 # Файл збереження стану між запусками GitHub Actions
-STATE_FILE = Path(os.getenv("STATE_FILE", "state/state.json"))
+STATE_FILE = Path(os.getenv("STATE_FILE") or "state/state.json")
 
 # Кількість повторних спроб при тимчасових збоях сайту ДТЕК / антибота
 MAX_FETCH_RETRIES = 3
@@ -88,19 +85,13 @@ class TuyaPowerSensor:
     Заготовка для майбутньої інтеграції з Tuya IoT Cloud API.
     Поки ключі TUYA_* не додані в GitHub Secrets — модуль вимкнено
     і він не виконує жодних запитів.
-
-    Коли купите Wi-Fi розетку Tuya:
-    1. Додайте бібліотеку `tinytuya` у requirements.txt.
-    2. Додайте в GitHub Secrets:
-       TUYA_API_REGION (eu), TUYA_ACCESS_ID, TUYA_ACCESS_SECRET, TUYA_DEVICE_ID.
-    3. Розкоментуйте блок запиту в методі `check_power()`.
     """
 
     def __init__(self) -> None:
-        self.access_id = os.getenv("TUYA_ACCESS_ID", "").strip()
-        self.access_secret = os.getenv("TUYA_ACCESS_SECRET", "").strip()
-        self.device_id = os.getenv("TUYA_DEVICE_ID", "").strip()
-        self.api_region = os.getenv("TUYA_API_REGION", "eu").strip()
+        self.access_id = (os.getenv("TUYA_ACCESS_ID") or "").strip()
+        self.access_secret = (os.getenv("TUYA_ACCESS_SECRET") or "").strip()
+        self.device_id = (os.getenv("TUYA_DEVICE_ID") or "").strip()
+        self.api_region = (os.getenv("TUYA_API_REGION") or "eu").strip()
 
     @property
     def is_configured(self) -> bool:
@@ -110,22 +101,6 @@ class TuyaPowerSensor:
         if not self.is_configured:
             return PhysicalPowerStatus(enabled=False)
 
-        # --- МАЙБУТНЯ РЕАЛІЗАЦІЯ (після купівлі розетки) ---
-        # import tinytuya
-        # cloud = tinytuya.Cloud(
-        #     apiRegion=self.api_region,
-        #     apiKey=self.access_id,
-        #     apiSecret=self.access_secret,
-        #     apiDeviceID=self.device_id,
-        # )
-        # info = cloud.getdevices(verbose=True)
-        # # Якщо розетка online у хмарі Tuya — світло є; якщо offline — світла немає
-        # is_online = ...
-        # return PhysicalPowerStatus(
-        #     enabled=True,
-        #     is_power_on=is_online,
-        #     checked_at=now_kyiv().strftime("%H:%M %d.%m.%Y"),
-        # )
         logger.info("Tuya secrets знайдено, але інтеграція ще в режимі заглушки.")
         return PhysicalPowerStatus(enabled=False)
 
@@ -154,12 +129,7 @@ def clean_text(value: Any) -> str:
 
 
 def parse_dtek_datetime(raw: str) -> Optional[datetime]:
-    """
-    Парсить формати дати ДТЕК, наприклад:
-      - '14:10 26.11.2026'
-      - 'до 14:10 26.11.2026'
-      - '26.11.2026 14:10'
-    """
+    """Парсить формати дати ДТЕК, наприклад: '14:10 26.11.2026' або 'до 14:10 26.11.2026'."""
     text = clean_text(raw)
     if not text:
         return None
@@ -213,7 +183,7 @@ class OutageBanner:
     reason: str = ""
     start_date: str = ""
     end_date: str = ""
-    outage_type: str = ""  # '1' = планове/стабілізаційне, '2' = аварійне/екстрене тощо
+    outage_type: str = ""
     update_timestamp: str = ""
 
     @property
@@ -240,9 +210,9 @@ class OutageBanner:
 @dataclass
 class DaySchedule:
     """Плановий графік відключень (ГПВ) на конкретну дату."""
-    date_iso: str           # '2026-11-26'
-    date_label: str         # '26.11.2026'
-    intervals: list[list[str]] = field(default_factory=list)   # [['08:00', '11:30'], ...]
+    date_iso: str
+    date_label: str
+    intervals: list[list[str]] = field(default_factory=list)
     possible_intervals: list[list[str]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -259,7 +229,7 @@ class DtekSnapshot:
     """Повний знімок даних із сайту ДТЕК для нашої адреси."""
     group_id: str = ""
     banner: OutageBanner = field(default_factory=OutageBanner)
-    schedules: dict[str, DaySchedule] = field(default_factory=dict)  # date_iso -> DaySchedule
+    schedules: dict[str, DaySchedule] = field(default_factory=dict)
     fact_update: str = ""
 
 
@@ -287,16 +257,7 @@ def _extract_intervals_from_flags(half_hour_flags: list[bool]) -> list[list[str]
 
 
 def parse_group_slots(slots: dict[str, str]) -> tuple[list[list[str]], list[list[str]]]:
-    """
-    Розбирає 24 годинні слоти ДТЕК ('1'..'24'):
-      yes     -> світло є всю годину
-      no      -> світла немає всю годину
-      first   -> немає у першій половині (00–30 хв)
-      second  -> немає у другій половині (30–60 хв)
-      maybe   -> можливе відключення всю годину
-      mfirst  -> можливе у першій половині
-      msecond -> можливе у другій половині
-    """
+    """Розбирає 24 годинні слоти ДТЕК ('1'..'24')."""
     definite_off = [False] * 48
     possible_off = [False] * 48
 
@@ -340,7 +301,6 @@ def extract_schedules_from_fact(
     today_date = now_kyiv().date()
     tomorrow_date = today_date + timedelta(days=1)
 
-    # Формуємо можливі варіанти ключа групи (наприклад, 'GPV3.1' або '3.1')
     candidate_keys = [group_id]
     if group_id.startswith("GPV"):
         candidate_keys.append(group_id.replace("GPV", "", 1))
@@ -389,11 +349,9 @@ def _find_house_entry(houses_map: dict[str, Any], target_house: str) -> Optional
     if not isinstance(houses_map, dict):
         return None
 
-    # 1. Точний збіг
     if target_house in houses_map and isinstance(houses_map[target_house], dict):
         return houses_map[target_house]
 
-    # 2. Збіг без урахування регістру та зайвих пробілів
     norm_target = clean_text(target_house).lower()
     for key, value in houses_map.items():
         if clean_text(key).lower() == norm_target and isinstance(value, dict):
@@ -432,14 +390,12 @@ def fetch_dtek_snapshot() -> Optional[DtekSnapshot]:
                 )
                 page = context.new_page()
 
-                # Маскуємо ознаки автоматизації для WAF Imperva
                 page.add_init_script(
                     "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
                 )
 
                 page.goto(DTEK_SHUTDOWNS_URL, wait_until="domcontentloaded", timeout=60_000)
 
-                # Чекаємо проходження JS-перевірки Imperva та появи об'єкта DisconSchedule або форми
                 page.wait_for_function(
                     """() => {
                         return Boolean(window.DisconSchedule) ||
@@ -448,10 +404,8 @@ def fetch_dtek_snapshot() -> Optional[DtekSnapshot]:
                     }""",
                     timeout=45_000,
                 )
-                # Невелика пауза для завершення ініціалізації cookies
                 page.wait_for_timeout(2000)
 
-                # Виконуємо AJAX-запит getHomeNum прямо з контексту сторінки
                 raw_payload = page.evaluate(
                     """async ({ city, street }) => {
                         const csrfMeta = document.querySelector('meta[name="csrf-token"]');
@@ -523,7 +477,6 @@ def fetch_dtek_snapshot() -> Optional[DtekSnapshot]:
                 )
                 return None
 
-            # 1. Розбираємо інформацію про поточне відключення (жовта картка, Фото 1)
             sub_type = clean_text(house_entry.get("sub_type"))
             start_date = clean_text(house_entry.get("start_date"))
             end_date = normalize_end_date_display(house_entry.get("end_date"))
@@ -544,7 +497,6 @@ def fetch_dtek_snapshot() -> Optional[DtekSnapshot]:
                 update_timestamp=update_ts,
             )
 
-            # 2. Визначаємо чергу (групу) будинку для планових графіків ГПВ
             reasons_list = house_entry.get("sub_type_reason") or []
             group_id = ""
             if isinstance(reasons_list, list) and reasons_list:
@@ -552,7 +504,6 @@ def fetch_dtek_snapshot() -> Optional[DtekSnapshot]:
             elif isinstance(reasons_list, str):
                 group_id = clean_text(reasons_list)
 
-            # 3. Розбираємо планові графіки (ГПВ) на сьогодні та завтра
             fact_obj = ajax_resp.get("fact") if isinstance(ajax_resp.get("fact"), dict) else page_fact
             schedules = extract_schedules_from_fact(fact_obj or {}, group_id)
             fact_update = clean_text((fact_obj or {}).get("update") or update_ts)
@@ -705,7 +656,6 @@ def build_banner_changed_message(
         elif curr.end_date:
             lines.append(f"🔌 Орієнтовне відновлення: <b>до {html.escape(curr.end_date)}</b>")
 
-        # Якщо перенесень більше одного, показуємо коротку історію
         if len(end_history) >= 3:
             chain = " → ".join(html.escape(x) for x in end_history[-4:])
             lines.append(f"<i>📜 Історія перенесень: {chain}</i>")
@@ -785,11 +735,7 @@ def check_pre_outage_warning(
     snapshot: DtekSnapshot,
     state: dict[str, Any],
 ) -> Optional[str]:
-    """
-    Перевіряє, чи починається планове відключення через 5–35 хвилин.
-    Надсилає попередження рівно 1 раз на кожен інтервал.
-    """
-    # Якщо зараз вже триває активне відключення за карткою ДТЕК — не дублюємо попередження
+    """Перевіряє, чи починається планове відключення через 5–35 хвилин."""
     if snapshot.banner.active:
         return None
 
@@ -798,7 +744,6 @@ def check_pre_outage_warning(
     tomorrow_iso = (now.date() + timedelta(days=1)).isoformat()
 
     notified: list[str] = state.get("notified_warnings", [])
-    # Прибираємо старі записи (залишаємо лише сьогодні/завтра)
     notified = [k for k in notified if k.startswith(today_iso) or k.startswith(tomorrow_iso)]
     state["notified_warnings"] = notified
 
@@ -844,7 +789,6 @@ def main() -> int:
     state = load_state()
     is_first_run = not bool(state)
 
-    # 1. Опціональна перевірка фізичної розетки Tuya (на майбутнє)
     tuya_sensor = TuyaPowerSensor()
     physical_status = tuya_sensor.check_power()
     if physical_status.enabled:
@@ -863,31 +807,23 @@ def main() -> int:
                 )
         state["tuya_power_on"] = physical_status.is_power_on
 
-    # 2. Завантаження актуальних даних із сайту ДТЕК
     snapshot = fetch_dtek_snapshot()
     if snapshot is None:
-        # Вимога 13-а: якщо сайт тимчасово не відповідає або спрацював антибот —
-        # тихо завершуємо цикл без спаму помилками і пробуємо в наступний запуск.
         logger.warning("Не вдалося отримати дані з ДТЕК у цьому циклі. Тихо спробуємо наступного разу.")
         return 0
 
     messages_to_send: list[str] = []
 
-    # ------------------------------------------------------------------
-    # 3. Перевірка картки поточного/аварійного відключення (Фото 1)
-    # ------------------------------------------------------------------
     prev_banner: dict[str, Any] = state.get("banner") or {}
     prev_active = bool(prev_banner.get("active", False))
     curr_banner = snapshot.banner
     end_history: list[str] = state.get("end_date_history", [])
 
     if curr_banner.active and not prev_active:
-        # Нове відключення
         end_history = [curr_banner.end_date] if curr_banner.end_date else []
         messages_to_send.append(build_banner_new_message(curr_banner))
 
     elif curr_banner.active and prev_active:
-        # Порівнюємо ТІЛЬКИ суттєві поля (ігноруємо зміну самої лише 'Дата оновлення інформації' — вимога 4-а!)
         meaningful_changed = (
             clean_text(prev_banner.get("reason")) != curr_banner.reason
             or clean_text(prev_banner.get("start_date")) != curr_banner.start_date
@@ -903,21 +839,16 @@ def main() -> int:
             logger.info("Картка відключення не змінилась (лише дата оновлення або без змін) — не турбуємо.")
 
     elif not curr_banner.active and prev_active:
-        # Відключення завершилося / картку прибрали
         messages_to_send.append(
             build_banner_resolved_message(prev_banner, curr_banner.update_timestamp)
         )
         end_history = []
 
-    # Оновлюємо збережений стан картки
     state["banner"] = curr_banner.to_dict()
     state["end_date_history"] = end_history
     if snapshot.group_id:
         state["group_id"] = snapshot.group_id
 
-    # ------------------------------------------------------------------
-    # 4. Перевірка планових графіків ГПВ (сьогодні / завтра)
-    # ------------------------------------------------------------------
     prev_schedules: dict[str, Any] = state.get("schedules") or {}
     changed_dates: list[str] = []
 
@@ -938,19 +869,12 @@ def main() -> int:
             )
         )
 
-    # Зберігаємо лише актуальні дати (сьогодні та завтра), щоб state.json не розростався
     state["schedules"] = {k: v.to_dict() for k, v in snapshot.schedules.items()}
 
-    # ------------------------------------------------------------------
-    # 5. Попередження за 15–30 хв до початку планового відключення
-    # ------------------------------------------------------------------
     warning_msg = check_pre_outage_warning(snapshot, state)
     if warning_msg:
         messages_to_send.append(warning_msg)
 
-    # ------------------------------------------------------------------
-    # 6. Вітальне повідомлення при самому першому запуску (якщо змін не було)
-    # ------------------------------------------------------------------
     if is_first_run and not messages_to_send:
         group_label = format_group_pretty(snapshot.group_id)
         group_part = f"\n🔢 Визначена черга: <b>{html.escape(group_label)}</b>" if group_label else ""
@@ -961,9 +885,6 @@ def main() -> int:
             f"<i>Я повідомлю вас одразу, щойно з'явиться аварія, зміниться графік або наблизиться планове вимкнення.</i>"
         )
 
-    # ------------------------------------------------------------------
-    # 7. Відправка повідомлень та збереження стану
-    # ------------------------------------------------------------------
     state["last_successful_check"] = now_kyiv().isoformat()
 
     for msg in messages_to_send:
