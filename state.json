@@ -5,11 +5,11 @@
     "start_date": "06:05 24.11.2026",
     "end_date": "18:10 26.11.2026",
     "outage_type": "2",
-    "update_timestamp": "17:18 26.11.2026"
+    "update_timestamp": "17:36 26.11.2026"
   },
   "end_date_history": [
     "18:10 26.11.2026"
   ],
   "schedules": {},
-  "last_successful_check": "2026-11-26T17:29:04.555521+02:00"
+  "last_successful_check": "2026-11-26T17:37:05.645320+02:00"
 }
