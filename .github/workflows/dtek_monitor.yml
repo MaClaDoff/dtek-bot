@@ -9,8 +9,6 @@ workflow_dispatch:
 repository_dispatch:
 types: [check-dtek]
 
-Щоб паралельні запуски не конфліктували під час збереження стану
-
 concurrency:
 group: dtek-monitor-run
 cancel-in-progress: false
@@ -64,12 +62,10 @@ steps:
     env:
       TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
       TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      # Опціонально: якщо задати адресу в Secrets, вона прихована в публічному репо
       DTEK_CITY: ${{ secrets.DTEK_CITY || 'м. Дніпро' }}
       DTEK_STREET: ${{ secrets.DTEK_STREET || 'пров. Добровольців' }}
       DTEK_HOUSE: ${{ secrets.DTEK_HOUSE || '10' }}
       STATE_FILE: state/state.json
-      # Заділ на майбутнє для розумної розетки Tuya
       TUYA_API_REGION: ${{ secrets.TUYA_API_REGION }}
       TUYA_ACCESS_ID: ${{ secrets.TUYA_ACCESS_ID }}
       TUYA_ACCESS_SECRET: ${{ secrets.TUYA_ACCESS_SECRET }}
@@ -94,7 +90,7 @@ steps:
 
       cd "$WORKTREE_DIR"
       git add state.json
-      if ! git diff --cached --quiet; then
+      if [ -n "$(git status --porcelain)" ]; then
         git commit -m "chore: update dtek state"
         git push origin bot-state
       else
