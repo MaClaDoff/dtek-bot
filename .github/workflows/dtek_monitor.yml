@@ -1,97 +1,102 @@
 name: DTEK Dnipro Outage Monitor
 
 on:
-schedule:
-- cron: '*/15 * * * *'
-workflow_dispatch:
-repository_dispatch:
-types: [check-dtek]
+  schedule:
+    - cron: '*/15 * * * *'
+  workflow_dispatch:
+  repository_dispatch:
+    types: [check-dtek]
 
 concurrency:
-group: dtek-monitor-run
-cancel-in-progress: false
+  group: dtek-monitor-run
+  cancel-in-progress: false
 
 permissions:
-contents: write
+  contents: write
 
 jobs:
-check-dtek:
-runs-on: ubuntu-latest
-timeout-minutes: 5
+  check-dtek:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
 
-steps:
-  - name: Checkout repository
-    uses: actions/checkout@v4
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-  - name: Load previous state
-    run: |
-      mkdir -p state
-      if git ls-remote --exit-code --heads origin bot-state >/dev/null 2>&1; then
-        git fetch origin bot-state
-        git show origin/bot-state:state.json > state/state.json 2>/dev/null || echo "{}" > state/state.json
-      else
-        echo "{}" > state/state.json
-      fi
+      - name: Load previous state
+        run: |
+          mkdir -p state
+          if git ls-remote --exit-code --heads origin bot-state >/dev/null 2>&1; then
+            git fetch origin bot-state
+            git show origin/bot-state:state.json > state/state.json 2>/dev/null || echo "{}" > state/state.json
+          else
+            echo "{}" > state/state.json
+          fi
 
-  - name: Set up Python 3.12
-    uses: actions/setup-python@v5
-    with:
-      python-version: '3.12'
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
 
-  - name: Install Python dependencies
-    run: pip install playwright==1.50.0 requests==2.32.3 tzdata==2025.1
+      - name: Install Python dependencies
+        run: pip install playwright==1.50.0 requests==2.32.3 tzdata==2025.1
 
-  - name: Cache Playwright Chromium
-    id: playwright-cache
-    uses: actions/cache@v4
-    with:
-      path: ~/.cache/ms-playwright
-      key: playwright-chromium-${{ runner.os }}-1.50.0
+      - name: Cache Playwright Chromium
+        id: playwright-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-chromium-${{ runner.os }}-1.50.0
 
-  - name: Install Chromium browser
-    run: |
-      if [ "${{ steps.playwright-cache.outputs.cache-hit }}" != "true" ]; then
-        playwright install chromium
-      fi
-      playwright install-deps chromium
+      - name: Install Chromium browser
+        run: |
+          if [ "${{ steps.playwright-cache.outputs.cache-hit }}" != "true" ]; then
+            playwright install chromium
+          fi
+          playwright install-deps chromium
 
-  - name: Run DTEK monitor
-    env:
-      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-      DTEK_CITY: ${{ secrets.DTEK_CITY }}
-      DTEK_STREET: ${{ secrets.DTEK_STREET }}
-      DTEK_HOUSE: ${{ secrets.DTEK_HOUSE }}
-      STATE_FILE: state/state.json
-      TUYA_API_REGION: ${{ secrets.TUYA_API_REGION }}
-      TUYA_ACCESS_ID: ${{ secrets.TUYA_ACCESS_ID }}
-      TUYA_ACCESS_SECRET: ${{ secrets.TUYA_ACCESS_SECRET }}
-      TUYA_DEVICE_ID: ${{ secrets.TUYA_DEVICE_ID }}
-    run: python dtek_monitor.d10
+      - name: Run DTEK monitor
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          DTEK_CITY: ${{ secrets.DTEK_CITY }}
+          DTEK_STREET: ${{ secrets.DTEK_STREET }}
+          DTEK_HOUSE: ${{ secrets.DTEK_HOUSE }}
+          STATE_FILE: state/state.json
+          TUYA_API_REGION: ${{ secrets.TUYA_API_REGION }}
+          TUYA_ACCESS_ID: ${{ secrets.TUYA_ACCESS_ID }}
+          TUYA_ACCESS_SECRET: ${{ secrets.TUYA_ACCESS_SECRET }}
+          TUYA_DEVICE_ID: ${{ secrets.TUYA_DEVICE_ID }}
+        run: |
+          if [ -f dtek_monitor.d10 ]; then
+            python dtek_monitor.d10
+          else
+            python dtek_monitor.py
+          fi
 
-  - name: Save updated state
-    run: |
-      git config user.name "github-actions[bot]"
-      git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+      - name: Save updated state
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      [ -f state/state.json ] || echo "{}" > state/state.json
+          [ -f state/state.json ] || echo "{}" > state/state.json
 
-      WORKTREE_DIR=$(mktemp -d)
-      if git ls-remote --exit-code --heads origin bot-state >/dev/null 2>&1; then
-        git fetch origin bot-state
-        git worktree add "$WORKTREE_DIR" origin/bot-state
-        git -C "$WORKTREE_DIR" checkout -B bot-state
-      else
-        git worktree add --orphan -b bot-state "$WORKTREE_DIR"
-      fi
+          WORKTREE_DIR=$(mktemp -d)
+          if git ls-remote --exit-code --heads origin bot-state >/dev/null 2>&1; then
+            git fetch origin bot-state
+            git worktree add "$WORKTREE_DIR" origin/bot-state
+            git -C "$WORKTREE_DIR" checkout -B bot-state
+          else
+            git worktree add --orphan -b bot-state "$WORKTREE_DIR"
+          fi
 
-      cp state/state.json "$WORKTREE_DIR/state.json"
+          cp state/state.json "$WORKTREE_DIR/state.json"
 
-      cd "$WORKTREE_DIR"
-      git add state.json
-      if [ -n "$(git status --porcelain)" ]; then
-        git commit -m "chore: update dtek state"
-        git push origin bot-state
-      else
-        echo "State unchanged, skipping commit."
-      fi
+          cd "$WORKTREE_DIR"
+          git add state.json
+          if [ -n "$(git status --porcelain)" ]; then
+            git commit -m "chore: update dtek state"
+            git push origin bot-state
+          else
+            echo "State unchanged, skipping commit."
+          fi
