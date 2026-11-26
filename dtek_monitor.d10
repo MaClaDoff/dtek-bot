@@ -28,7 +28,7 @@ import requests
 from playwright.sync_api import sync_playwright
 
 # ==============================================================================
-# 1. НАЛАШТУВАННЯ (підтягуються з GitHub Secrets або використовуються за замовчуванням)
+# 1. НАЛАШТУВАННЯ
 # ==============================================================================
 
 KYIV_TZ = ZoneInfo("Europe/Kyiv")
@@ -36,27 +36,20 @@ KYIV_TZ = ZoneInfo("Europe/Kyiv")
 DTEK_BASE_URL = "https://www.dtek-dnem.com.ua"
 DTEK_SHUTDOWNS_URL = f"{DTEK_BASE_URL}/ua/shutdowns"
 
-# Адреса за замовчуванням (за потреби можна перевизначити в GitHub Secrets)
 DTEK_CITY = (os.getenv("DTEK_CITY") or "м. Дніпро").strip()
 DTEK_STREET = (os.getenv("DTEK_STREET") or "пров. Добровольців").strip()
 DTEK_HOUSE = (os.getenv("DTEK_HOUSE") or "10").strip()
 
-# Telegram
 TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
 
-# Тихі години (без звуку сповіщень): 23:00 — 07:00 за київським часом
 QUIET_HOURS_START = int(os.getenv("QUIET_HOURS_START") or "23")
 QUIET_HOURS_END = int(os.getenv("QUIET_HOURS_END") or "7")
 
-# Вікно попередження про планове відключення (хвилин до початку)
 PRE_OUTAGE_WARN_MIN_MINUTES = 5
 PRE_OUTAGE_WARN_MAX_MINUTES = 35
 
-# Файл збереження стану між запусками GitHub Actions
 STATE_FILE = Path(os.getenv("STATE_FILE") or "state/state.json")
-
-# Кількість повторних спроб при тимчасових збоях сайту ДТЕК / антибота
 MAX_FETCH_RETRIES = 3
 
 logging.basicConfig(
@@ -73,7 +66,6 @@ logger = logging.getLogger("dtek_monitor")
 
 @dataclass
 class PhysicalPowerStatus:
-    """Фактичний стан електроенергії в квартирі (з розумної розетки)."""
     enabled: bool = False
     is_power_on: Optional[bool] = None
     checked_at: Optional[str] = None
@@ -81,12 +73,6 @@ class PhysicalPowerStatus:
 
 
 class TuyaPowerSensor:
-    """
-    Заготовка для майбутньої інтеграції з Tuya IoT Cloud API.
-    Поки ключі TUYA_* не додані в GitHub Secrets — модуль вимкнено
-    і він не виконує жодних запитів.
-    """
-
     def __init__(self) -> None:
         self.access_id = (os.getenv("TUYA_ACCESS_ID") or "").strip()
         self.access_secret = (os.getenv("TUYA_ACCESS_SECRET") or "").strip()
@@ -100,7 +86,6 @@ class TuyaPowerSensor:
     def check_power(self) -> PhysicalPowerStatus:
         if not self.is_configured:
             return PhysicalPowerStatus(enabled=False)
-
         logger.info("Tuya secrets знайдено, але інтеграція ще в режимі заглушки.")
         return PhysicalPowerStatus(enabled=False)
 
@@ -114,7 +99,6 @@ def now_kyiv() -> datetime:
 
 
 def is_quiet_hours(dt: Optional[datetime] = None) -> bool:
-    """Перевіряє, чи зараз тихі години (23:00 — 07:00 за Києвом)."""
     current = dt or now_kyiv()
     hour = current.hour
     if QUIET_HOURS_START > QUIET_HOURS_END:
@@ -129,7 +113,6 @@ def clean_text(value: Any) -> str:
 
 
 def parse_dtek_datetime(raw: str) -> Optional[datetime]:
-    """Парсить формати дати ДТЕК, наприклад: '14:10 26.11.2026' або 'до 14:10 26.11.2026'."""
     text = clean_text(raw)
     if not text:
         return None
@@ -145,7 +128,6 @@ def parse_dtek_datetime(raw: str) -> Optional[datetime]:
 
 
 def format_time_delta_ua(old_dt: datetime, new_dt: datetime) -> str:
-    """Форматує різницю між часами у зрозумілий вигляд: '+3 год 50 хв' або '-45 хв'."""
     diff_seconds = int((new_dt - old_dt).total_seconds())
     if diff_seconds == 0:
         return "без змін"
@@ -167,7 +149,6 @@ def format_time_delta_ua(old_dt: datetime, new_dt: datetime) -> str:
 
 
 def normalize_end_date_display(raw: str) -> str:
-    """Прибирає дублювання 'до ', щоб красиво форматувати час відновлення."""
     text = clean_text(raw)
     return re.sub(r"^до\s+", "", text, flags=re.IGNORECASE).strip()
 
@@ -178,7 +159,6 @@ def normalize_end_date_display(raw: str) -> str:
 
 @dataclass
 class OutageBanner:
-    """Дані з жовтої інформаційної картки будинку (як на Фото 1)."""
     active: bool = False
     reason: str = ""
     start_date: str = ""
@@ -209,7 +189,6 @@ class OutageBanner:
 
 @dataclass
 class DaySchedule:
-    """Плановий графік відключень (ГПВ) на конкретну дату."""
     date_iso: str
     date_label: str
     intervals: list[list[str]] = field(default_factory=list)
@@ -226,7 +205,6 @@ class DaySchedule:
 
 @dataclass
 class DtekSnapshot:
-    """Повний знімок даних із сайту ДТЕК для нашої адреси."""
     group_id: str = ""
     banner: OutageBanner = field(default_factory=OutageBanner)
     schedules: dict[str, DaySchedule] = field(default_factory=dict)
@@ -239,7 +217,6 @@ def _minutes_to_hhmm(total_minutes: int) -> str:
 
 
 def _extract_intervals_from_flags(half_hour_flags: list[bool]) -> list[list[str]]:
-    """Об'єднує сусідні 30-хвилинні слоти відключень у діапазони ['HH:MM', 'HH:MM']."""
     intervals: list[list[str]] = []
     start_idx: Optional[int] = None
 
@@ -257,7 +234,6 @@ def _extract_intervals_from_flags(half_hour_flags: list[bool]) -> list[list[str]
 
 
 def parse_group_slots(slots: dict[str, str]) -> tuple[list[list[str]], list[list[str]]]:
-    """Розбирає 24 годинні слоти ДТЕК ('1'..'24')."""
     definite_off = [False] * 48
     possible_off = [False] * 48
 
@@ -289,7 +265,6 @@ def extract_schedules_from_fact(
     fact_obj: dict[str, Any],
     group_id: str,
 ) -> dict[str, DaySchedule]:
-    """Витягує підтверджені графіки на сьогодні та завтра для нашої черги (групи)."""
     result: dict[str, DaySchedule] = {}
     if not fact_obj or not isinstance(fact_obj, dict) or not group_id:
         return result
@@ -341,11 +316,10 @@ def extract_schedules_from_fact(
 
 
 # ==============================================================================
-# 5. ОТРИМАННЯ ДАНИХ ІЗ САЙТУ ДТЕК ЧЕРЕЗ PLAYWRIGHT (ОБХІД IMPERVA/INCAPSULA)
+# 5. ОТРИМАННЯ ДАНИХ ІЗ САЙТУ ДТЕК ЧЕРЕЗ PLAYWRIGHT
 # ==============================================================================
 
 def _find_house_entry(houses_map: dict[str, Any], target_house: str) -> Optional[dict[str, Any]]:
-    """Шукає запис нашого будинку в JSON-відповіді getHomeNum."""
     if not isinstance(houses_map, dict):
         return None
 
@@ -361,11 +335,6 @@ def _find_house_entry(houses_map: dict[str, Any], target_house: str) -> Optional
 
 
 def fetch_dtek_snapshot() -> Optional[DtekSnapshot]:
-    """
-    Відкриває сайт ДТЕК у headless Chromium, проходить антибот-перевірку Imperva,
-    виконує нативний AJAX-запит getHomeNum всередині контексту браузера
-    та зчитує window.DisconSchedule.
-    """
     for attempt in range(1, MAX_FETCH_RETRIES + 1):
         logger.info("Спроба %d/%d: завантаження %s ...", attempt, MAX_FETCH_RETRIES, DTEK_SHUTDOWNS_URL)
         try:
@@ -552,7 +521,6 @@ def save_state(state: dict[str, Any]) -> None:
 
 
 def send_telegram_message(text: str) -> bool:
-    """Надсилає повідомлення в Telegram з урахуванням тихих годин (23:00–07:00)."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         logger.error("Не задано TELEGRAM_BOT_TOKEN або TELEGRAM_CHAT_ID!")
         return False
@@ -582,7 +550,7 @@ def send_telegram_message(text: str) -> bool:
 
 
 # ==============================================================================
-# 7. ФОРМУВАННЯ ПОВІДОМЛЕНЬ (УКРАЇНСЬКОЮ) ТА РОЗУМНЕ ПОРІВНЯННЯ ЗМІН
+# 7. ФОРМУВАННЯ ПОВІДОМЛЕНЬ ТА ПОРІВНЯННЯ ЗМІН
 # ==============================================================================
 
 def format_address_line() -> str:
@@ -735,7 +703,6 @@ def check_pre_outage_warning(
     snapshot: DtekSnapshot,
     state: dict[str, Any],
 ) -> Optional[str]:
-    """Перевіряє, чи починається планове відключення через 5–35 хвилин."""
     if snapshot.banner.active:
         return None
 
