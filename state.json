@@ -2,15 +2,16 @@
   "banner": {
     "active": true,
     "reason": "Аварійні ремонтні роботи",
-    "start_date": "06:05 24.11.2026",
-    "end_date": "22:10 26.11.2026",
+    "start_date": "18:29 26.11.2026",
+    "end_date": "22:30 26.11.2026",
     "outage_type": "2",
-    "update_timestamp": "18:33 26.11.2026"
+    "update_timestamp": "19:18 26.11.2026"
   },
   "end_date_history": [
     "18:10 26.11.2026",
-    "22:10 26.11.2026"
+    "22:10 26.11.2026",
+    "22:30 26.11.2026"
   ],
   "schedules": {},
-  "last_successful_check": "2026-11-26T18:34:54.117468+02:00"
+  "last_successful_check": "2026-11-26T19:34:24.047805+02:00"
 }
