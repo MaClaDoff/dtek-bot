@@ -22,14 +22,18 @@ SETTINGS_GRADLE = r"""
 pluginManagement {
     repositories {
         google()
-        mavenCentral()
+        maven { url = uri("https://maven-central.storage-download.googleapis.com/maven2/") }
+        maven { url = uri("https://maven-central-eu.storage-download.googleapis.com/maven2/") }
         gradlePluginPortal()
+        mavenCentral()
     }
 }
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
         google()
+        maven { url = uri("https://maven-central.storage-download.googleapis.com/maven2/") }
+        maven { url = uri("https://maven-central-eu.storage-download.googleapis.com/maven2/") }
         mavenCentral()
     }
 }
@@ -65,8 +69,8 @@ android {
         applicationId = "ua.dnipro.d10svitlo"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.0.1"
     }
 
     buildTypes {
@@ -1455,8 +1459,6 @@ import android.view.Gravity
 import android.view.View
 import android.view.ViewGroup
 import android.widget.Button
-import android.widget.EditText
-import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.Switch
@@ -1534,7 +1536,6 @@ class MainActivity : AppCompatActivity() {
     private val colorMint = Color.parseColor("#2A9D8F")
     private val colorTerracotta = Color.parseColor("#C85555")
     private val colorOchre = Color.parseColor("#D4A348")
-    private val colorAccentBlue = Color.parseColor("#60A5FA")
 
     private lateinit var store: AppStore
     private val executor = Executors.newSingleThreadExecutor()
@@ -2343,7 +2344,7 @@ class MainActivity : AppCompatActivity() {
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { bottomMargin = dp(10) }
+            )
         }
 
         card.addView(TextView(this).apply {
@@ -2413,61 +2414,6 @@ class MainActivity : AppCompatActivity() {
         }
         card.addView(testBtn)
         contentContainer.addView(card)
-
-        // Картка джерела даних
-        val srcCard = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            background = makeGlassDrawable(14)
-            setPadding(dp(14), dp(12), dp(14), dp(12))
-        }
-        srcCard.addView(TextView(this).apply {
-            text = "Джерело даних (GitHub state.json)"
-            setTextColor(textPrimary())
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 13f)
-            typeface = Typeface.DEFAULT_BOLD
-            setPadding(0, 0, 0, dp(6))
-        })
-
-        val urlInput = EditText(this).apply {
-            setText(s.stateUrl)
-            setTextColor(textPrimary())
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11.5f)
-            background = makeGlassDrawable(8, fillOverride = glassPillColor())
-            setPadding(dp(10), dp(8), dp(10), dp(8))
-            maxLines = 2
-        }
-        srcCard.addView(urlInput)
-
-        val saveUrlBtn = Button(this).apply {
-            text = "Зберегти URL та перевірити"
-            isAllCaps = false
-            setTextColor(Color.WHITE)
-            background = GradientDrawable().apply {
-                cornerRadius = dp(10).toFloat()
-                setColor(colorAccentBlue)
-            }
-            layoutParams = LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = dp(8) }
-            setOnClickListener {
-                val u = urlInput.text.toString().trim()
-                s = s.copy(stateUrl = u.ifEmpty { AppConfig.DEFAULT_STATE_URL })
-                store.saveSettings(s)
-                Toast.makeText(this@MainActivity, "URL збережено", Toast.LENGTH_SHORT).show()
-                runManualSync(silentToast = false)
-            }
-        }
-        srcCard.addView(saveUrlBtn)
-
-        srcCard.addView(TextView(this).apply {
-            text = "Фонова перевірка: кожні 30 хв • Версія 1.0.0\nАдреса: ${AppConfig.ADDRESS_SHORT}"
-            setTextColor(textMuted())
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-            setPadding(0, dp(10), 0, 0)
-        })
-
-        contentContainer.addView(srcCard)
     }
 
     private fun makeSwitchRow(label: String, checked: Boolean, onChanged: (Boolean) -> Unit): LinearLayout {
