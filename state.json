@@ -5,7 +5,7 @@
     "start_date": "",
     "end_date": "",
     "outage_type": "",
-    "update_timestamp": "22:35 27.11.2026"
+    "update_timestamp": "23:34 27.11.2026"
   },
   "end_date_history": [],
   "schedules": {
@@ -52,9 +52,11 @@
       "possible_intervals": []
     }
   },
-  "last_successful_check": "2026-11-27T22:36:09.407220+02:00",
+  "last_successful_check": "2026-11-27T23:36:04.396229+02:00",
   "group_id": "GPV17.1",
-  "notified_warnings": [],
+  "notified_warnings": [
+    "2026-11-28 00:00"
+  ],
   "fact_update": "27.11.2026 21:56",
   "schedule_source": "DTEK AJAX getHomeNum",
   "last_tg_update_id": 416484877
