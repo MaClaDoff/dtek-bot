@@ -1,6 +1,6 @@
 """
-Генератор нативного Android-додатку «Д10 Світло» (Kotlin + Material 3 DayNight + WorkManager + Widget 4x1).
-Запускається автоматично у GitHub Actions перед командою `gradle assembleDebug`.
+Генератор нативного Android-додатку «Д10 Світло» v1.0.2
+(Kotlin + Material 3 DayNight + WorkManager + Widget 4x1).
 """
 
 from pathlib import Path
@@ -13,10 +13,6 @@ def write_file(rel_path: str, content: str) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(content.lstrip("\n"), encoding="utf-8")
 
-
-# ------------------------------------------------------------------------------
-# 1. Gradle конфігурація
-# ------------------------------------------------------------------------------
 
 SETTINGS_GRADLE = r"""
 pluginManagement {
@@ -69,8 +65,8 @@ android {
         applicationId = "ua.dnipro.d10svitlo"
         minSdk = 26
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.0.1"
+        versionCode = 3
+        versionName = "1.0.2"
     }
 
     buildTypes {
@@ -99,10 +95,6 @@ dependencies {
     implementation("androidx.work:work-runtime-ktx:2.9.1")
 }
 """
-
-# ------------------------------------------------------------------------------
-# 2. AndroidManifest.xml та ресурси (іконка «Д10 ⚡», віджет 4x1 Glass, тема)
-# ------------------------------------------------------------------------------
 
 ANDROID_MANIFEST = r"""
 <?xml version="1.0" encoding="utf-8"?>
@@ -166,7 +158,6 @@ THEMES_NIGHT_XML = r"""
 </resources>
 """
 
-# 10-В: Личный знак «Д10 ⚡» (Adaptive Icon)
 IC_LAUNCHER_XML = r"""
 <?xml version="1.0" encoding="utf-8"?>
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
@@ -198,25 +189,21 @@ IC_LAUNCHER_FG = r"""
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <!-- Золота блискавка зверху -->
     <path
         android:fillColor="#FACC15"
         android:pathData="M57,26 L45.5,40.5 L53,40.5 L50,50.5 L62.5,35.5 L55,35.5 Z" />
-    <!-- Д -->
     <path
         android:pathData="M34.5,56.5 L44,56.5 L44,74 M34.5,56.5 C34.5,64 33.5,70 31.5,74 M29.5,74 L46.5,74 M29.5,74 L29.5,78 M46.5,74 L46.5,78"
         android:strokeWidth="3.6"
         android:strokeColor="#FFFFFF"
         android:strokeLineCap="round"
         android:strokeLineJoin="round" />
-    <!-- 1 -->
     <path
         android:pathData="M53,60.5 L57.5,56.5 L57.5,76 M53.5,76 L61.5,76"
         android:strokeWidth="3.6"
         android:strokeColor="#FFFFFF"
         android:strokeLineCap="round"
         android:strokeLineJoin="round" />
-    <!-- 0 -->
     <path
         android:pathData="M73,56.5 C76.8,56.5 79,59.5 79,66.25 C79,73 76.8,76 73,76 C69.2,76 67,73 67,66.25 C67,59.5 69.2,56.5 73,56.5 Z"
         android:strokeWidth="3.6"
@@ -239,7 +226,6 @@ IC_NOTIF_BOLT = r"""
 </vector>
 """
 
-# 9-Б: Напівпрозорий віджет 4x1 (Glass)
 WIDGET_INFO_XML = r"""
 <?xml version="1.0" encoding="utf-8"?>
 <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
@@ -366,10 +352,6 @@ WIDGET_LAYOUT_XML = r"""
 </LinearLayout>
 """
 
-# ------------------------------------------------------------------------------
-# 3. Kotlin вихідний код: ModelsAndStore.kt
-# ------------------------------------------------------------------------------
-
 MODELS_AND_STORE_KT = r"""
 package ua.dnipro.d10svitlo
 
@@ -378,7 +360,6 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.time.Duration
 import java.time.Instant
-import java.time.LocalDate
 import java.time.LocalDateTime
 import java.time.OffsetDateTime
 import java.time.ZoneId
@@ -414,6 +395,7 @@ data class DtekState(
     val banner: BannerInfo = BannerInfo(),
     val endDateHistory: List<String> = emptyList(),
     val schedules: Map<String, DaySchedule> = emptyMap(),
+    val factUpdate: String = "",
     val lastSuccessfulCheck: String = ""
 )
 
@@ -499,6 +481,7 @@ object DtekParser {
                 banner = banner,
                 endDateHistory = historyList,
                 schedules = schedulesMap,
+                factUpdate = root.optString("fact_update", "").trim(),
                 lastSuccessfulCheck = root.optString("last_successful_check", "").trim()
             )
         } catch (_: Exception) {
@@ -618,6 +601,34 @@ object DtekParser {
         return result
     }
 
+    fun formatLightOnIntervals(day: DaySchedule): String {
+        val onSegs = buildTimelineSegments(day).filter { it.status == 0 }
+        if (onSegs.isEmpty()) return "немає гарантованих вікон"
+        if (onSegs.size == 1 && onSegs[0].startMin == 0 && onSegs[0].endMin == 1440) {
+            return "весь день (00:00–24:00)"
+        }
+        return onSegs.joinToString(", ") {
+            "${minutesToHHMM(it.startMin)}–${minutesToHHMM(it.endMin)}"
+        }
+    }
+
+    fun formatScheduleNotificationPair(day: DaySchedule): Pair<String, String> {
+        val lightStr = formatLightOnIntervals(day)
+        val offStr = formatCompactIntervals(day)
+        val slots = buildHalfHourSlots(day)
+        val onMins = slots.count { it == 0 } * 30
+        val offMins = slots.count { it == 1 } * 30
+        val shortBody = "🟢 Світло: $lightStr"
+        val bigText = buildString {
+            append("🟢 Світло буде: $lightStr")
+            if (day.intervals.isNotEmpty() || day.possibleIntervals.isNotEmpty()) {
+                append("\n🪫 Немає: $offStr")
+                append("\n📊 Разом: 🟢 ${formatDurationUa(onMins)} / 🪫 ${formatDurationUa(offMins)}")
+            }
+        }
+        return Pair(shortBody, bigText)
+    }
+
     fun minutesSinceServerCheck(state: DtekState?): Long? {
         val raw = state?.lastSuccessfulCheck ?: return null
         if (raw.isBlank()) return null
@@ -658,7 +669,7 @@ object DtekParser {
                 return TrafficLightStatus(
                     2,
                     "Планове вимкнення до $endStr",
-                    "За графіком ГПВ${if (groupTxt.isNotEmpty()) " • $groupTxt" else ""}"
+                    "Світло повернеться о $endStr${if (groupTxt.isNotEmpty()) " • $groupTxt" else ""}"
                 )
             }
             if (currentSeg != null && currentSeg.status == 2) {
@@ -670,7 +681,6 @@ object DtekParser {
                 )
             }
 
-            // Шукаємо найближче відключення сьогодні
             val nextOff = today.intervals
                 .map { Pair(timeToMinutes(it.first), it) }
                 .filter { it.first > nowMin }
@@ -683,13 +693,13 @@ object DtekParser {
                     TrafficLightStatus(
                         1,
                         "Скоро вимкнення о ${nextOff.second.first}",
-                        "Заплановано: $rangeStr"
+                        "Без світла: $rangeStr"
                     )
                 } else {
                     TrafficLightStatus(
                         0,
                         "Світло за графіком",
-                        "Наступне: $rangeStr"
+                        "Наступне вимкнення: $rangeStr"
                     )
                 }
             }
@@ -699,16 +709,16 @@ object DtekParser {
         val tomorrow = state.schedules[tomorrowIso]
         val tomorrowFirst = tomorrow?.intervals?.firstOrNull()
         val sub = when {
-            tomorrowFirst != null -> "Завтра з ${tomorrowFirst.first} — ${tomorrowFirst.second}"
+            tomorrowFirst != null -> "Завтра без світла з ${tomorrowFirst.first} — ${tomorrowFirst.second}"
             today != null -> "Сьогодні вимкнень більше немає"
-            else -> AppConfig.ADDRESS_SHORT
+            else -> "Активних аварій немає"
         }
         return TrafficLightStatus(0, "Світло за графіком", sub)
     }
 
     fun formatCompactIntervals(day: DaySchedule): String {
         if (day.intervals.isEmpty() && day.possibleIntervals.isEmpty()) {
-            return "Відключень не заплановано"
+            return "відключень не заплановано"
         }
         val parts = mutableListOf<String>()
         for ((s, e) in day.intervals) parts.add("$s–$e")
@@ -741,23 +751,15 @@ object DtekParser {
 
         state.schedules[todayIso]?.let { d ->
             sb.append("📅 Сьогодні (${d.dateLabel}):\n")
-            sb.append(formatShareDayLines(d)).append("\n")
+            sb.append("  🟢 Світло: ${formatLightOnIntervals(d)}\n")
+            sb.append("  🪫 Немає: ${formatCompactIntervals(d)}\n\n")
         }
         state.schedules[tomorrowIso]?.let { d ->
             sb.append("🔮 Завтра (${d.dateLabel}):\n")
-            sb.append(formatShareDayLines(d)).append("\n")
+            sb.append("  🟢 Світло: ${formatLightOnIntervals(d)}\n")
+            sb.append("  🪫 Немає: ${formatCompactIntervals(d)}\n")
         }
         return sb.toString().trim()
-    }
-
-    private fun formatShareDayLines(day: DaySchedule): String {
-        if (day.intervals.isEmpty() && day.possibleIntervals.isEmpty()) {
-            return "  • Відключень не заплановано\n"
-        }
-        val sb = StringBuilder()
-        for ((s, e) in day.intervals) sb.append("  • 🪫 $s — $e\n")
-        for ((s, e) in day.possibleIntervals) sb.append("  • 🟡 $s — $e (можливе)\n")
-        return sb.toString()
     }
 }
 
@@ -900,10 +902,6 @@ class AppStore(context: Context) {
 }
 """
 
-# ------------------------------------------------------------------------------
-# 4. Kotlin: NotificationHelper.kt (11-А ультра-короткі + 6-Г тихі години)
-# ------------------------------------------------------------------------------
-
 NOTIFICATION_HELPER_KT = r"""
 package ua.dnipro.d10svitlo
 
@@ -977,6 +975,7 @@ object NotificationHelper {
         context: Context,
         title: String,
         body: String,
+        bigText: String? = null,
         isTest: Boolean = false
     ) {
         ensureChannels(context)
@@ -987,7 +986,6 @@ object NotificationHelper {
 
         val quietNow = !isTest && isQuietHoursNow(settings)
         if (quietNow && !settings.quietSilentOnly) {
-            // Користувач обрав повністю не турбувати вночі
             return
         }
 
@@ -1013,6 +1011,10 @@ object NotificationHelper {
             .setAutoCancel(true)
             .setSilent(quietNow)
 
+        if (!bigText.isNullOrBlank()) {
+            builder.setStyle(NotificationCompat.BigTextStyle().bigText(bigText))
+        }
+
         val notifId = ((System.currentTimeMillis() % 100000) + title.hashCode()).toInt()
         try {
             NotificationManagerCompat.from(context).notify(notifId, builder.build())
@@ -1021,10 +1023,6 @@ object NotificationHelper {
     }
 }
 """
-
-# ------------------------------------------------------------------------------
-# 5. Kotlin: DtekSyncManager.kt (WorkManager кожні 30 хв + точне попередження)
-# ------------------------------------------------------------------------------
 
 SYNC_MANAGER_KT = r"""
 package ua.dnipro.d10svitlo
@@ -1129,7 +1127,7 @@ object DtekSyncManager {
             readTimeout = 12_000
             useCaches = false
             setRequestProperty("Cache-Control", "no-cache")
-            setRequestProperty("User-Agent", "D10SvitloAndroid/1.0")
+            setRequestProperty("User-Agent", "D10SvitloAndroid/1.0.2")
         }
         try {
             val code = conn.responseCode
@@ -1213,19 +1211,19 @@ object DtekSyncManager {
         if (tomorrowChanged) {
             val day = state.schedules[tomorrowIso]
             if (day != null) {
-                val title = "🔮 Графік на завтра (${day.dateLabel})"
-                val body = DtekParser.formatCompactIntervals(day)
-                NotificationHelper.sendShortAlert(context, title, body)
-                store.addHistoryEvent("🔮", title, body)
+                val title = "🔮 Графік на завтра (${day.dateLabel.take(5)})"
+                val (shortBody, bigText) = DtekParser.formatScheduleNotificationPair(day)
+                NotificationHelper.sendShortAlert(context, title, shortBody, bigText)
+                store.addHistoryEvent("🔮", title, shortBody)
             }
         }
         if (todayChanged) {
             val day = state.schedules[todayIso]
             if (day != null) {
-                val title = "📅 Оновився графік на сьогодні"
-                val body = DtekParser.formatCompactIntervals(day)
-                NotificationHelper.sendShortAlert(context, title, body)
-                store.addHistoryEvent("📅", title, body)
+                val title = "📅 Графік на сьогодні (${day.dateLabel.take(5)})"
+                val (shortBody, bigText) = DtekParser.formatScheduleNotificationPair(day)
+                NotificationHelper.sendShortAlert(context, title, shortBody, bigText)
+                store.addHistoryEvent("📅", title, shortBody)
             }
         }
 
@@ -1268,8 +1266,8 @@ object DtekSyncManager {
 
                 if (minsUntil in 5..35) {
                     warned.add(warnKey)
-                    val title = "⏳ Відключення о $startStr (до $endStr)"
-                    val body = "Через ~$minsUntil хв за графіком"
+                    val title = "⏳ Відключення о $startStr"
+                    val body = "Через ~$minsUntil хв • світло повернеться о $endStr"
                     NotificationHelper.sendShortAlert(context, title, body)
                     store.addHistoryEvent("⏳", title, body)
                 }
@@ -1335,10 +1333,6 @@ class DtekSyncWorker(
     }
 }
 """
-
-# ------------------------------------------------------------------------------
-# 6. Kotlin: D10WidgetProvider.kt (9-Б Напівпрозорий 4x1 Glass)
-# ------------------------------------------------------------------------------
 
 WIDGET_PROVIDER_KT = r"""
 package ua.dnipro.d10svitlo
@@ -1432,10 +1426,6 @@ class D10WidgetProvider : AppWidgetProvider() {
     }
 }
 """
-
-# ------------------------------------------------------------------------------
-# 7. Kotlin: MainActivity.kt (Увесь дизайн: 1-Г, 2-Б, 3-Б, 4-В, 5-В, 6-А, 7-Б, 8-Б, 12-Б)
-# ------------------------------------------------------------------------------
 
 MAIN_ACTIVITY_KT = r"""
 package ua.dnipro.d10svitlo
@@ -1532,7 +1522,6 @@ class HourBrickView(
 
 class MainActivity : AppCompatActivity() {
 
-    // 4-В: М'яка пастельна палітра (бережна до очей)
     private val colorMint = Color.parseColor("#2A9D8F")
     private val colorTerracotta = Color.parseColor("#C85555")
     private val colorOchre = Color.parseColor("#D4A348")
@@ -1540,8 +1529,8 @@ class MainActivity : AppCompatActivity() {
     private lateinit var store: AppStore
     private val executor = Executors.newSingleThreadExecutor()
 
-    private var activeTab: Int = 0 // 0 = Світло, 1 = Історія, 2 = Налашт.
-    private var selectedDayTab: Int = 0 // 0 = Сьогодні, 1 = Завтра
+    private var activeTab: Int = 0
+    private var selectedDayTab: Int = 0
     private var isSyncing: Boolean = false
     private var isOfflineLastAttempt: Boolean = false
 
@@ -1608,7 +1597,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun buildRootLayout() {
-        // 1-Г: Виразний атмосферний градієнт фону
         val bgColors = if (isDarkTheme()) {
             intArrayOf(
                 Color.parseColor("#0F172A"),
@@ -1632,7 +1620,6 @@ class MainActivity : AppCompatActivity() {
             )
         }
 
-        // Верхня компактна панель (12-Б: кнопка оновлення + кнопка поділитись)
         val topBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -1679,7 +1666,6 @@ class MainActivity : AppCompatActivity() {
         topBar.addView(refreshBtn)
         root.addView(topBar)
 
-        // Прокручувана область контенту
         val scroll = ScrollView(this).apply {
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
@@ -1696,7 +1682,6 @@ class MainActivity : AppCompatActivity() {
         scroll.addView(contentContainer)
         root.addView(scroll)
 
-        // 6-А: Нижня панель вкладок (3 кнопки)
         val bottomBar = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             background = GradientDrawable().apply {
@@ -1819,10 +1804,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // ==========================================================================
-    // ВКЛАДКА 0: ГОЛОВНИЙ КОМПАКТНИЙ ДАШБОРД (2-Б, 3-Б, 5-В, 7-Б, 8-Б)
-    // ==========================================================================
-
     private fun renderHomeTab(state: DtekState?) {
         val light = DtekParser.computeTrafficLight(state)
         val statusColor = when (light.level) {
@@ -1831,7 +1812,6 @@ class MainActivity : AppCompatActivity() {
             else -> colorMint
         }
 
-        // 2-Б: Картка статусу з акцентною полосою зліва (спокійна вночі)
         val heroOuter = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             background = makeGlassDrawable(14)
@@ -1889,14 +1869,15 @@ class MainActivity : AppCompatActivity() {
             setPadding(0, dp(2), 0, 0)
         })
 
-        heroBody.addView(TextView(this).apply {
-            text = AppConfig.ADDRESS_SHORT
-            setTextColor(textMuted())
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
-            setPadding(0, dp(2), 0, 0)
-        })
+        if (light.subtitle != AppConfig.ADDRESS_SHORT) {
+            heroBody.addView(TextView(this).apply {
+                text = AppConfig.ADDRESS_SHORT
+                setTextColor(textMuted())
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
+                setPadding(0, dp(2), 0, 0)
+            })
+        }
 
-        // Бейдж застарілих даних (>40 хв) або офлайн-режиму
         val staleMinutes = DtekParser.minutesSinceServerCheck(state)
         if (isOfflineLastAttempt) {
             heroBody.addView(makeStalePill("📡 Офлайн-режим • показано збережений кеш"))
@@ -1908,12 +1889,10 @@ class MainActivity : AppCompatActivity() {
         heroOuter.addView(heroBody)
         contentContainer.addView(heroOuter)
 
-        // 7-Б: Табличка фактів аварії та перенесень (коли є активна аварія)
         if (state != null && state.banner.active) {
             contentContainer.addView(buildOutageFactTableCard(state))
         }
 
-        // Картка графіка ГПВ (Сьогодні / Завтра + 3-Б цеглинки + 5-В повна стрічка)
         contentContainer.addView(buildScheduleDashboardCard(state))
     }
 
@@ -1936,7 +1915,6 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    // 7-Б: Табличка фактів (ключ — значення)
     private fun buildOutageFactTableCard(state: DtekState): LinearLayout {
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -2022,7 +2000,6 @@ class MainActivity : AppCompatActivity() {
         val todaySched = state?.schedules?.get(todayIso)
         val tomorrowSched = state?.schedules?.get(tomorrowIso)
 
-        // Перемикач вкладок «Сьогодні» / «Завтра»
         val segRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             background = makeGlassDrawable(10, fillOverride = glassPillColor())
@@ -2071,7 +2048,6 @@ class MainActivity : AppCompatActivity() {
         val maybeMins = slots.count { it == 2 } * 30
         val onMins = 1440 - offMins - maybeMins
 
-        // Компактний підсумок дня (8-Б)
         val statsRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -2099,25 +2075,31 @@ class MainActivity : AppCompatActivity() {
         }
         card.addView(statsRow)
 
-        // 3-Б: 24-годинна шкала цеглинками (2 ряди по 12 годин)
         val currentHour = now.hour
         val isToday = selectedDayTab == 0
         card.addView(buildBrickRow(slots, 0, 11, isToday, currentHour))
         card.addView(buildBrickRow(slots, 12, 23, isToday, currentHour))
 
-        // Розділювач
+        // Компактна легенда кольорів під візуальним графіком
+        card.addView(TextView(this).apply {
+            text = "🟢 Є світло    🪫 Немає    🟡 Можливе"
+            setTextColor(textMuted())
+            setTextSize(TypedValue.COMPLEX_UNIT_SP, 10f)
+            gravity = Gravity.CENTER
+            setPadding(0, dp(2), 0, dp(2))
+        })
+
         card.addView(View(this).apply {
             setBackgroundColor(glassBorderColor())
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 dp(1)
             ).apply {
-                topMargin = dp(8)
+                topMargin = dp(6)
                 bottomMargin = dp(6)
             }
         })
 
-        // 5-В: Повна стрічка дня (і вікна зі світлом, і без світла)
         val segments = DtekParser.buildTimelineSegments(currentDay)
         val nowMin = now.hour * 60 + now.minute
 
@@ -2167,6 +2149,19 @@ class MainActivity : AppCompatActivity() {
             })
 
             card.addView(row)
+        }
+
+        // 6-А: Час останнього оновлення графіка на сайті ДТЕК
+        val updatedLabel = state?.factUpdate?.takeIf { it.isNotBlank() }
+            ?: state?.banner?.updateTimestamp?.takeIf { it.isNotBlank() }
+        if (!updatedLabel.isNullOrBlank()) {
+            card.addView(TextView(this).apply {
+                text = "📢 Графік оновлено ДТЕК: $updatedLabel"
+                setTextColor(textMuted())
+                setTextSize(TypedValue.COMPLEX_UNIT_SP, 10.5f)
+                gravity = Gravity.END
+                setPadding(0, dp(6), dp(2), 0)
+            })
         }
 
         return card
@@ -2237,10 +2232,6 @@ class MainActivity : AppCompatActivity() {
         2 -> colorOchre
         else -> colorMint
     }
-
-    // ==========================================================================
-    // ВКЛАДКА 1: ІСТОРІЯ ПОДІЙ (ОСТАННІ 20)
-    // ==========================================================================
 
     private fun renderHistoryTab() {
         val history = store.getHistory()
@@ -2329,10 +2320,6 @@ class MainActivity : AppCompatActivity() {
             contentContainer.addView(card)
         }
     }
-
-    // ==========================================================================
-    // ВКЛАДКА 2: НАЛАШТУВАННЯ (ТИХІ ГОДИНИ 6-Г, ТЕСТ СПОВІЩЕННЯ)
-    // ==========================================================================
 
     private fun renderSettingsTab() {
         var s = store.getSettings()
@@ -2515,7 +2502,7 @@ def main() -> None:
     write_file(f"{pkg}/D10WidgetProvider.kt", WIDGET_PROVIDER_KT)
     write_file(f"{pkg}/MainActivity.kt", MAIN_ACTIVITY_KT)
 
-    print("Android project generated successfully in ./android_build")
+    print("Android project v1.0.2 generated successfully in ./android_build")
 
 
 if __name__ == "__main__":
