@@ -1,23 +1,15 @@
 {
   "banner": {
-    "active": true,
-    "reason": "Аварійні ремонтні роботи",
-    "start_date": "06:05 24.11.2026",
-    "end_date": "10:10 27.11.2026",
-    "outage_type": "2",
-    "update_timestamp": "09:47 27.11.2026"
+    "active": false,
+    "reason": "Відсутня електроенергія",
+    "start_date": "",
+    "end_date": "",
+    "outage_type": "",
+    "update_timestamp": "10:51 27.11.2026"
   },
-  "end_date_history": [
-    "18:10 26.11.2026",
-    "22:10 26.11.2026",
-    "22:30 26.11.2026",
-    "02:10 27.11.2026",
-    "02:30 27.11.2026",
-    "06:30 27.11.2026",
-    "10:30 27.11.2026",
-    "10:10 27.11.2026"
-  ],
+  "end_date_history": [],
   "schedules": {},
-  "last_successful_check": "2026-11-27T09:51:25.185751+02:00",
-  "group_id": "GPV17.1"
+  "last_successful_check": "2026-11-27T10:53:53.924377+02:00",
+  "group_id": "GPV17.1",
+  "notified_warnings": []
 }
