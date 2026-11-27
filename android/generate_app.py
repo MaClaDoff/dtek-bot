@@ -1,5 +1,5 @@
 """
-Генератор нативного Android-додатку «Д10 Світло» v1.0.2
+Генератор нативного Android-додатку «Д10 Світло» v1.0.3
 (Kotlin + Material 3 DayNight + WorkManager + Widget 4x1).
 """
 
@@ -65,8 +65,8 @@ android {
         applicationId = "ua.dnipro.d10svitlo"
         minSdk = 26
         targetSdk = 34
-        versionCode = 3
-        versionName = "1.0.2"
+        versionCode = 4
+        versionName = "1.0.3"
     }
 
     buildTypes {
@@ -381,7 +381,18 @@ data class BannerInfo(
     val endDate: String = "",
     val outageType: String = "",
     val updateTimestamp: String = ""
-)
+) {
+    fun isStabilization(): Boolean {
+        val r = reason.lowercase()
+        return r.contains("стабілізаційн") || r.contains("графік") || r.contains("погодинн")
+    }
+
+    fun isEmergency(): Boolean {
+        if (isStabilization()) return false
+        val r = reason.lowercase()
+        return r.contains("аварійн") || r.contains("екстре") || r.contains("ремонтн") || outageType == "2"
+    }
+}
 
 data class DaySchedule(
     val dateIso: String,
@@ -645,6 +656,8 @@ object DtekParser {
             return TrafficLightStatus(1, "Немає даних", "Натисніть ↻ для завантаження")
         }
 
+        val groupTxt = formatGroupPretty(state.groupId)
+
         if (state.banner.active) {
             val endTxt = if (state.banner.endDate.isNotEmpty()) {
                 "до ${shortEndTime(state.banner.endDate)}"
@@ -652,14 +665,18 @@ object DtekParser {
                 "час уточнюється"
             }
             val reason = state.banner.reason.ifBlank { "Відсутня електроенергія" }
-            return TrafficLightStatus(2, "Аварія • $endTxt", reason)
+            return if (state.banner.isStabilization()) {
+                val sub = if (groupTxt.isNotEmpty()) "Планове вимкнення ГПВ • $groupTxt" else reason
+                TrafficLightStatus(2, "За графіком • $endTxt", sub)
+            } else {
+                TrafficLightStatus(2, "Аварія • $endTxt", reason)
+            }
         }
 
         val now = nowKyiv()
         val todayIso = now.toLocalDate().toString()
         val nowMin = now.hour * 60 + now.minute
         val today = state.schedules[todayIso]
-        val groupTxt = formatGroupPretty(state.groupId)
 
         if (today != null) {
             val segments = buildTimelineSegments(today)
@@ -668,7 +685,7 @@ object DtekParser {
                 val endStr = minutesToHHMM(currentSeg.endMin)
                 return TrafficLightStatus(
                     2,
-                    "Планове вимкнення до $endStr",
+                    "За графіком • до $endStr",
                     "Світло повернеться о $endStr${if (groupTxt.isNotEmpty()) " • $groupTxt" else ""}"
                 )
             }
@@ -738,7 +755,8 @@ object DtekParser {
         sb.append("\n")
 
         if (state.banner.active) {
-            sb.append("🚨 ${state.banner.reason.ifBlank { "Відсутня електроенергія" }}\n")
+            val ico = if (state.banner.isStabilization()) "⚡️" else "🚨"
+            sb.append("$ico ${state.banner.reason.ifBlank { "Відсутня електроенергія" }}\n")
             if (state.banner.startDate.isNotEmpty()) sb.append("🕒 Початок: ${state.banner.startDate}\n")
             if (state.banner.endDate.isNotEmpty()) sb.append("🔌 Відновлення: до ${state.banner.endDate}\n")
             sb.append("\n")
@@ -1127,7 +1145,7 @@ object DtekSyncManager {
             readTimeout = 12_000
             useCaches = false
             setRequestProperty("Cache-Control", "no-cache")
-            setRequestProperty("User-Agent", "D10SvitloAndroid/1.0.2")
+            setRequestProperty("User-Agent", "D10SvitloAndroid/1.0.3")
         }
         try {
             val code = conn.responseCode
@@ -1146,14 +1164,16 @@ object DtekSyncManager {
 
         if (curr.active && !prev.active) {
             val endShort = DtekParser.shortEndTime(curr.endDate)
-            val title = if (endShort.isNotEmpty()) {
-                "🚨 Відсутнє світло • до $endShort"
+            val isStab = curr.isStabilization()
+            val icon = if (isStab) "⚡️" else "🚨"
+            val title = if (isStab) {
+                if (endShort.isNotEmpty()) "⚡️ За графіком • до $endShort" else "⚡️ Планове відключення"
             } else {
-                "🚨 Відсутня електроенергія"
+                if (endShort.isNotEmpty()) "🚨 Аварія • до $endShort" else "🚨 Аварійне відключення"
             }
             val body = curr.reason.ifBlank { AppConfig.ADDRESS_SHORT }
             NotificationHelper.sendShortAlert(context, title, body)
-            store.addHistoryEvent("🚨", title, body)
+            store.addHistoryEvent(icon, title, body)
         } else if (curr.active && prev.active) {
             val meaningfulChanged =
                 prev.reason != curr.reason ||
@@ -1460,9 +1480,6 @@ import java.time.Instant
 import java.time.format.DateTimeFormatter
 import java.util.concurrent.Executors
 
-/**
- * 3-Б: Один годинний «цеглинковий» сегмент 24-годинної шкали з підтримкою півгодин (first/second).
- */
 class HourBrickView(
     context: Context,
     private val leftColor: Int,
@@ -1926,15 +1943,19 @@ class MainActivity : AppCompatActivity() {
             ).apply { bottomMargin = dp(8) }
         }
 
+        val b = state.banner
         card.addView(TextView(this).apply {
-            text = "Деталі відключення (ДТЕК)"
+            text = if (b.isStabilization()) {
+                "Планове відключення (ДТЕК)"
+            } else {
+                "Аварійне відключення (ДТЕК)"
+            }
             setTextColor(textMuted())
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 11f)
             typeface = Typeface.DEFAULT_BOLD
             setPadding(0, 0, 0, dp(6))
         })
 
-        val b = state.banner
         val hist = state.endDateHistory
         val deltaSuffix = if (hist.size >= 2) {
             val prevDt = DtekParser.parseDtekDateTime(hist[hist.size - 2])
@@ -2080,7 +2101,6 @@ class MainActivity : AppCompatActivity() {
         card.addView(buildBrickRow(slots, 0, 11, isToday, currentHour))
         card.addView(buildBrickRow(slots, 12, 23, isToday, currentHour))
 
-        // Компактна легенда кольорів під візуальним графіком
         card.addView(TextView(this).apply {
             text = "🟢 Є світло    🪫 Немає    🟡 Можливе"
             setTextColor(textMuted())
@@ -2151,7 +2171,6 @@ class MainActivity : AppCompatActivity() {
             card.addView(row)
         }
 
-        // 6-А: Час останнього оновлення графіка на сайті ДТЕК
         val updatedLabel = state?.factUpdate?.takeIf { it.isNotBlank() }
             ?: state?.banner?.updateTimestamp?.takeIf { it.isNotBlank() }
         if (!updatedLabel.isNullOrBlank()) {
@@ -2502,7 +2521,7 @@ def main() -> None:
     write_file(f"{pkg}/D10WidgetProvider.kt", WIDGET_PROVIDER_KT)
     write_file(f"{pkg}/MainActivity.kt", MAIN_ACTIVITY_KT)
 
-    print("Android project v1.0.2 generated successfully in ./android_build")
+    print("Android project v1.0.3 generated successfully in ./android_build")
 
 
 if __name__ == "__main__":
