@@ -1,18 +1,18 @@
 """
-DTEK Dnipro Outage Monitor (Serverless / GitHub Actions)
---------------------------------------------------------
+DTEK Dnipro Outage Monitor v1.2 (Serverless / GitHub Actions)
+-------------------------------------------------------------
 Моніторинг аварійних, екстрених та планових відключень (ГПВ)
 на сайті https://www.dtek-dnem.com.ua/ua/shutdowns
 зі сповіщеннями в Telegram (повністю українською мовою) та
 експортом даних у state.json для Android-додатку «Д10 Світло».
 
-Надійне отримання графіків ГПВ у 4 рівні:
-  1. Відповідь AJAX getHomeNum (із примусовим updateFact)
-  2. Об'єкт window.DisconSchedule.fact на сторінці ДТЕК
-  3. Прямий парсинг DisconSchedule.fact із HTML-коду сторінки
-  4. Автоматичний резерв із дзеркала Baskerville42/outage-data-ua (dnipro.json)
-
-Закладено інтерфейс для майбутнього підключення Wi-Fi розетки Tuya.
+Нове у v1.2:
+  - Коректне розрізнення стабілізаційних (планових) та аварійних відключень
+    навіть коли ДТЕК передає outage_type="2" для ГПВ.
+  - Примусова відправка актуального статусу і графіка (FORCE_NOTIFY=true).
+  - Обробка вхідних команд /start та /status (getUpdates): коли новий
+    користувач запускає бота або хтось пише /status — бот надсилає актуальний
+    статус та графіки (без збереження чужих Chat ID у публічний state.json).
 """
 
 from __future__ import annotations
@@ -51,6 +51,8 @@ DTEK_HOUSE = (os.getenv("DTEK_HOUSE") or "10").strip()
 
 TELEGRAM_BOT_TOKEN = (os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 TELEGRAM_CHAT_ID = (os.getenv("TELEGRAM_CHAT_ID") or "").strip()
+
+FORCE_NOTIFY = (os.getenv("FORCE_NOTIFY") or "").strip().lower() in ("true", "1", "yes")
 
 QUIET_HOURS_START = int(os.getenv("QUIET_HOURS_START") or "23")
 QUIET_HOURS_END = int(os.getenv("QUIET_HOURS_END") or "7")
@@ -185,13 +187,25 @@ class OutageBanner:
     update_timestamp: str = ""
 
     @property
-    def is_emergency(self) -> bool:
+    def is_stabilization(self) -> bool:
+        """ДТЕК часто шле outage_type='2' навіть для ГПВ — пріоритет за текстом причини."""
         r_low = self.reason.lower()
         return (
-            self.outage_type == "2"
-            or "аварійн" in r_low
+            "стабілізаційн" in r_low
+            or "графік" in r_low
+            or "погодинн" in r_low
+        )
+
+    @property
+    def is_emergency(self) -> bool:
+        if self.is_stabilization:
+            return False
+        r_low = self.reason.lower()
+        return (
+            "аварійн" in r_low
             or "екстре" in r_low
             or "ремонтн" in r_low
+            or self.outage_type == "2"
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -263,11 +277,6 @@ def _extract_intervals_from_flags(half_hour_flags: list[bool]) -> list[list[str]
 
 
 def compute_day_breakdown(day: DaySchedule) -> tuple[list[list[str]], int, int, int]:
-    """
-    Обчислює інтервали, коли світло МАЄ БУТИ (гарантовано),
-    а також сумарні хвилини: (light_intervals, on_mins, off_mins, maybe_mins).
-    """
-    # 0 = світло є, 1 = відключення, 2 = можливе
     slots = [0] * 48
     for start_s, end_s in day.possible_intervals:
         s_idx = _hhmm_to_minutes(start_s) // 30
@@ -336,7 +345,6 @@ def _parse_fact_day_key(raw_key: Any) -> Optional[date]:
             ts = int(text)
             if ts > 10**11:
                 ts //= 1000
-            # +3 год захищає від зсуву на 1 год при переході UTC/DST
             return (datetime.fromtimestamp(ts, tz=KYIV_TZ) + timedelta(hours=3)).date()
         except (ValueError, OSError, OverflowError):
             return None
@@ -416,7 +424,6 @@ def extract_schedules_from_fact(
 
 
 def extract_fact_from_html(page_html: str) -> Optional[dict[str, Any]]:
-    """Витягує JSON із `DisconSchedule.fact = {...}` напряму з HTML-коду сторінки."""
     if not page_html:
         return None
     decoder = json.JSONDecoder()
@@ -431,18 +438,13 @@ def extract_fact_from_html(page_html: str) -> Optional[dict[str, Any]]:
 
 
 def fetch_mirror_fact() -> Optional[dict[str, Any]]:
-    """
-    Автоматичний резерв: завантажує актуальний fact для Дніпра з публічного дзеркала
-    Baskerville42/outage-data-ua (оновлюється кожні ~5 хв з того ж сайту ДТЕК).
-    """
     try:
         resp = requests.get(
             f"{MIRROR_DNIPRO_URL}?t={int(time.time())}",
             timeout=15,
-            headers={"User-Agent": "D10SvitloBot/1.1"},
+            headers={"User-Agent": "D10SvitloBot/1.2"},
         )
         if not resp.ok:
-            logger.warning("Резервне дзеркало повернуло HTTP %d", resp.status_code)
             return None
         payload = resp.json()
         if isinstance(payload, dict):
@@ -505,7 +507,6 @@ def fetch_dtek_snapshot() -> Optional[DtekSnapshot]:
 
                 page.goto(DTEK_SHUTDOWNS_URL, wait_until="domcontentloaded", timeout=60_000)
 
-                # Етап 1: чекаємо проходження Imperva та появи сторінки ДТЕК
                 page.wait_for_function(
                     """() => {
                         return Boolean(window.DisconSchedule) ||
@@ -515,7 +516,6 @@ def fetch_dtek_snapshot() -> Optional[DtekSnapshot]:
                     timeout=45_000,
                 )
 
-                # Етап 2: даємо до 12 сек на виконання inline-скриптів DisconSchedule.fact
                 try:
                     page.wait_for_function(
                         """() => {
@@ -539,7 +539,6 @@ def fetch_dtek_snapshot() -> Optional[DtekSnapshot]:
 
                         const ds = window.DisconSchedule || {};
 
-                        // Навмисно передаємо застарілу дату, щоб PHP-бекенд ДТЕК повернув свіжий блок fact
                         const params = new URLSearchParams();
                         params.append('method', 'getHomeNum');
                         params.append('data[0][name]', 'city');
@@ -618,7 +617,6 @@ def fetch_dtek_snapshot() -> Optional[DtekSnapshot]:
 
             group_id = group_ids[0] if group_ids else ""
 
-            # 4-рівневий пошук валідного графіка ГПВ (ніколи не затираємо порожнім словником)
             html_fact = extract_fact_from_html(page_html)
             fact_sources: list[tuple[str, Optional[dict[str, Any]]]] = [
                 ("DTEK AJAX getHomeNum", ajax_resp.get("fact") if isinstance(ajax_resp.get("fact"), dict) else None),
@@ -639,18 +637,8 @@ def fetch_dtek_snapshot() -> Optional[DtekSnapshot]:
                     chosen_fact_update = clean_text(candidate_fact.get("update"))
                     chosen_source = src_name
                     break
-                else:
-                    sample_days = list(candidate_fact.get("data", {}).keys())[:3]
-                    logger.info(
-                        "Джерело '%s' має fact.data (%s), але не збіглось із групою %s.",
-                        src_name,
-                        sample_days,
-                        group_ids,
-                    )
 
-            # Рівень 4: резервне дзеркало dnipro.json, якщо сайт ДТЕК не віддав графік
             if not schedules and group_ids:
-                logger.info("Пробуємо резервне джерело графіків (Baskerville42/outage-data-ua)...")
                 mirror_fact = fetch_mirror_fact()
                 if mirror_fact and _is_valid_fact_obj(mirror_fact):
                     extracted = extract_schedules_from_fact(mirror_fact, group_ids)
@@ -670,12 +658,12 @@ def fetch_dtek_snapshot() -> Optional[DtekSnapshot]:
             )
 
             logger.info(
-                "Успішно отримано дані: active=%s, group=%s, schedules=%s, source=%s, fact_update=%s",
+                "Успішно отримано дані: active=%s, stab=%s, group=%s, schedules=%s, source=%s",
                 banner.active,
+                banner.is_stabilization,
                 group_id or "не визначено",
                 list(schedules.keys()),
                 chosen_source or "немає",
-                fact_update or "-",
             )
             return DtekSnapshot(
                 group_id=group_id,
@@ -715,15 +703,20 @@ def save_state(state: dict[str, Any]) -> None:
     )
 
 
-def send_telegram_message(text: str) -> bool:
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.error("Не задано TELEGRAM_BOT_TOKEN або TELEGRAM_CHAT_ID!")
+def send_telegram_message(
+    text: str,
+    chat_id: Optional[str] = None,
+    force_loud: bool = False,
+) -> bool:
+    target_chat = (chat_id or TELEGRAM_CHAT_ID).strip()
+    if not TELEGRAM_BOT_TOKEN or not target_chat:
+        logger.error("Не задано TELEGRAM_BOT_TOKEN або chat_id!")
         return False
 
-    silent = is_quiet_hours()
+    silent = False if force_loud else is_quiet_hours()
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
+        "chat_id": target_chat,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
@@ -761,7 +754,9 @@ def format_group_pretty(group_id: str) -> str:
 
 def build_banner_new_message(banner: OutageBanner) -> str:
     if banner.is_emergency:
-        header = "🚨 <b>За вашою адресою відсутня електроенергія!</b>"
+        header = "🚨 <b>Аварійне відключення електроенергії!</b>"
+    elif banner.is_stabilization:
+        header = "⚡️ <b>Планове відключення за графіком (ГПВ)</b>"
     else:
         header = "⚡️ <b>Зафіксовано відключення електроенергії</b>"
 
@@ -784,11 +779,12 @@ def build_banner_changed_message(
     curr: OutageBanner,
     end_history: list[str],
 ) -> str:
-    lines = [
-        "🔄 <b>Оновлення інформації про відключення!</b>",
-        format_address_line(),
-        "",
-    ]
+    header = (
+        "🔄 <b>Оновлення планового відключення (ГПВ)</b>"
+        if curr.is_stabilization
+        else "🔄 <b>Оновлення інформації про аварійне відключення!</b>"
+    )
+    lines = [header, format_address_line(), ""]
 
     prev_reason = clean_text(prev.get("reason"))
     if prev_reason and curr.reason and prev_reason != curr.reason:
@@ -855,7 +851,6 @@ def format_day_schedule_block(title: str, day: DaySchedule) -> str:
         lines.append("🟢 <b>Світло має бути весь день</b> (00:00 — 24:00)")
         return "\n".join(lines)
 
-    # 1. Текстовий перелік, КОЛИ МАЄ БУТИ СВІТЛО
     if light_intervals:
         lines.append("🟢 <b>Світло має бути:</b>")
         for start, end in light_intervals:
@@ -863,7 +858,6 @@ def format_day_schedule_block(title: str, day: DaySchedule) -> str:
     else:
         lines.append("🟢 <b>Світло має бути:</b> немає гарантованих вікон")
 
-    # 2. Періоди відключень (3-А)
     if day.intervals:
         lines.append("🪫 <b>Відключення:</b>")
         for start, end in day.intervals:
@@ -874,7 +868,6 @@ def format_day_schedule_block(title: str, day: DaySchedule) -> str:
         for start, end in day.possible_intervals:
             lines.append(f"  • {start} — {end}")
 
-    # 3. Підсумок годин
     totals = [f"🟢 {format_duration_ua(on_mins)}", f"🪫 {format_duration_ua(off_mins)}"]
     if maybe_mins > 0:
         totals.append(f"🟡 {format_duration_ua(maybe_mins)}")
@@ -916,6 +909,102 @@ def build_schedule_update_message(
         lines.append(f"<i>📢 Графік оновлено ДТЕК: {html.escape(snapshot.fact_update)}</i>")
 
     return "\n".join(lines)
+
+
+def build_current_status_messages(snapshot: DtekSnapshot) -> list[str]:
+    """Формує повний актуальний звіт (статус + графіки) для /start, /status та FORCE_NOTIFY."""
+    msgs: list[str] = []
+
+    if snapshot.banner.active:
+        msgs.append(build_banner_new_message(snapshot.banner))
+    else:
+        group_label = format_group_pretty(snapshot.group_id)
+        group_line = f"\n🔢 <b>{html.escape(group_label)}</b>" if group_label else ""
+        ts_line = (
+            f"\n\n<i>📢 Оновлено на сайті ДТЕК: {html.escape(snapshot.fact_update)}</i>"
+            if snapshot.fact_update
+            else ""
+        )
+        msgs.append(
+            f"🟢 <b>На сайті ДТЕК активних відключень зараз немає</b>\n"
+            f"{format_address_line()}{group_line}{ts_line}"
+        )
+
+    if snapshot.schedules:
+        msgs.append(
+            build_schedule_update_message(
+                snapshot=snapshot,
+                changed_dates=list(snapshot.schedules.keys()),
+                is_initial=True,
+            )
+        )
+
+    return msgs
+
+
+def process_incoming_bot_commands(snapshot: DtekSnapshot, state: dict[str, Any]) -> None:
+    """
+    Обробляє вхідні команди /start та /status від нових і поточних користувачів.
+    Приватність: у публічний state.json пишеться лише числовий last_tg_update_id.
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        return
+
+    last_update_id = int(state.get("last_tg_update_id") or 0)
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates"
+    params: dict[str, Any] = {
+        "timeout": 0,
+        "allowed_updates": json.dumps(["message"]),
+    }
+    if last_update_id > 0:
+        params["offset"] = last_update_id + 1
+
+    try:
+        resp = requests.get(url, params=params, timeout=15)
+        if not resp.ok:
+            logger.warning("getUpdates HTTP %d: %s", resp.status_code, resp.text[:150])
+            return
+        data = resp.json()
+        if not data.get("ok"):
+            return
+        updates = data.get("result") or []
+    except Exception as exc:
+        logger.warning("Помилка запиту getUpdates: %s", exc)
+        return
+
+    if not updates:
+        return
+
+    max_uid = last_update_id
+    target_chats: list[str] = []
+
+    for upd in updates:
+        uid = int(upd.get("update_id") or 0)
+        if uid > max_uid:
+            max_uid = uid
+
+        msg = upd.get("message") or {}
+        chat = msg.get("chat") or {}
+        chat_id = str(chat.get("id") or "").strip()
+        text = clean_text(msg.get("text"))
+        if not chat_id or not text:
+            continue
+
+        cmd = text.split()[0].lower().split("@")[0]
+        if cmd in ("/start", "/status", "/now", "/check", "/info"):
+            if chat_id not in target_chats:
+                target_chats.append(chat_id)
+
+    state["last_tg_update_id"] = max_uid
+
+    if not target_chats:
+        return
+
+    reply_messages = build_current_status_messages(snapshot)
+    logger.info("Оброблено команди /start або /status від %d користувач(ів).", len(target_chats))
+    for cid in target_chats:
+        for msg_text in reply_messages:
+            send_telegram_message(msg_text, chat_id=cid, force_loud=True)
 
 
 def check_pre_outage_warning(
@@ -971,7 +1060,13 @@ def check_pre_outage_warning(
 # ==============================================================================
 
 def main() -> int:
-    logger.info("Запуск перевірки ДТЕК для: %s, %s, буд. %s", DTEK_CITY, DTEK_STREET, DTEK_HOUSE)
+    logger.info(
+        "Запуск перевірки ДТЕК для: %s, %s, буд. %s (force=%s)",
+        DTEK_CITY,
+        DTEK_STREET,
+        DTEK_HOUSE,
+        FORCE_NOTIFY,
+    )
 
     state = load_state()
     is_first_run = not bool(state)
@@ -1023,7 +1118,7 @@ def main() -> int:
                 build_banner_changed_message(prev_banner, curr_banner, end_history)
             )
         else:
-            logger.info("Картка відключення не змінилась (лише дата оновлення або без змін) — не турбуємо.")
+            logger.info("Картка відключення не змінилась — не турбуємо.")
 
     elif not curr_banner.active and prev_active:
         messages_to_send.append(
@@ -1056,7 +1151,6 @@ def main() -> int:
             )
         )
 
-    # Оновлюємо schedules у state.json, лише якщо графіки реально завантажились
     if snapshot.schedules:
         state["schedules"] = {k: v.to_dict() for k, v in snapshot.schedules.items()}
         if snapshot.fact_update:
@@ -1068,23 +1162,22 @@ def main() -> int:
     if warning_msg:
         messages_to_send.append(warning_msg)
 
-    if is_first_run and not messages_to_send:
-        group_label = format_group_pretty(snapshot.group_id)
-        group_part = f"\n🔢 Визначена черга: <b>{html.escape(group_label)}</b>" if group_label else ""
-        messages_to_send.append(
-            f"🤖 <b>Моніторинг ДТЕК успішно підключено!</b>\n"
-            f"{format_address_line()}{group_part}\n\n"
-            f"🟢 На даний момент активних відключень на сайті ДТЕК немає.\n"
-            f"<i>Я повідомлю вас одразу, щойно з'явиться аварія, зміниться графік або наблизиться планове вимкнення.</i>"
-        )
+    if FORCE_NOTIFY:
+        logger.info("Активовано FORCE_NOTIFY — примусово надсилаємо повний актуальний статус.")
+        for msg in build_current_status_messages(snapshot):
+            send_telegram_message(msg, force_loud=True)
+    else:
+        if is_first_run and not messages_to_send:
+            messages_to_send = build_current_status_messages(snapshot)
+        for msg in messages_to_send:
+            send_telegram_message(msg)
+
+    # Обробляємо /start та /status від нових і поточних користувачів
+    process_incoming_bot_commands(snapshot, state)
 
     state["last_successful_check"] = now_kyiv().isoformat()
-
-    for msg in messages_to_send:
-        send_telegram_message(msg)
-
     save_state(state)
-    logger.info("Перевірку завершено. Надіслано повідомлень: %d.", len(messages_to_send))
+    logger.info("Перевірку завершено успішно.")
     return 0
 
 
