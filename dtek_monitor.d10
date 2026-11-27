@@ -3,10 +3,16 @@ DTEK Dnipro Outage Monitor (Serverless / GitHub Actions)
 --------------------------------------------------------
 Моніторинг аварійних, екстрених та планових відключень (ГПВ)
 на сайті https://www.dtek-dnem.com.ua/ua/shutdowns
-зі сповіщеннями в Telegram (повністю українською мовою).
+зі сповіщеннями в Telegram (повністю українською мовою) та
+експортом даних у state.json для Android-додатку «Д10 Світло».
 
-Закладено архітектурний інтерфейс для майбутнього підключення
-розумної Wi-Fi розетки Tuya (відстеження фактичної наявності світла).
+Надійне отримання графіків ГПВ у 4 рівні:
+  1. Відповідь AJAX getHomeNum (із примусовим updateFact)
+  2. Об'єкт window.DisconSchedule.fact на сторінці ДТЕК
+  3. Прямий парсинг DisconSchedule.fact із HTML-коду сторінки
+  4. Автоматичний резерв із дзеркала Baskerville42/outage-data-ua (dnipro.json)
+
+Закладено інтерфейс для майбутнього підключення Wi-Fi розетки Tuya.
 """
 
 from __future__ import annotations
@@ -19,7 +25,7 @@ import re
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Optional
 from zoneinfo import ZoneInfo
@@ -35,6 +41,9 @@ KYIV_TZ = ZoneInfo("Europe/Kyiv")
 
 DTEK_BASE_URL = "https://www.dtek-dnem.com.ua"
 DTEK_SHUTDOWNS_URL = f"{DTEK_BASE_URL}/ua/shutdowns"
+MIRROR_DNIPRO_URL = (
+    "https://raw.githubusercontent.com/Baskerville42/outage-data-ua/main/data/dnipro.json"
+)
 
 DTEK_CITY = (os.getenv("DTEK_CITY") or "м. Дніпро").strip()
 DTEK_STREET = (os.getenv("DTEK_STREET") or "пров. Добровольців").strip()
@@ -148,6 +157,15 @@ def format_time_delta_ua(old_dt: datetime, new_dt: datetime) -> str:
     return f"{sign}{' '.join(parts)}"
 
 
+def format_duration_ua(total_minutes: int) -> str:
+    hours, minutes = divmod(max(0, total_minutes), 60)
+    if hours and minutes:
+        return f"{hours} год {minutes} хв"
+    if hours:
+        return f"{hours} год"
+    return f"{minutes} хв"
+
+
 def normalize_end_date_display(raw: str) -> str:
     text = clean_text(raw)
     return re.sub(r"^до\s+", "", text, flags=re.IGNORECASE).strip()
@@ -209,6 +227,7 @@ class DtekSnapshot:
     banner: OutageBanner = field(default_factory=OutageBanner)
     schedules: dict[str, DaySchedule] = field(default_factory=dict)
     fact_update: str = ""
+    schedule_source: str = ""
 
 
 def _minutes_to_hhmm(total_minutes: int) -> str:
@@ -216,14 +235,24 @@ def _minutes_to_hhmm(total_minutes: int) -> str:
     return f"{h:02d}:{m:02d}"
 
 
+def _hhmm_to_minutes(hhmm: str) -> int:
+    parts = hhmm.strip().split(":")
+    if len(parts) < 2:
+        return 0
+    try:
+        return max(0, min(1440, int(parts[0]) * 60 + int(parts[1])))
+    except ValueError:
+        return 0
+
+
 def _extract_intervals_from_flags(half_hour_flags: list[bool]) -> list[list[str]]:
     intervals: list[list[str]] = []
     start_idx: Optional[int] = None
 
-    for idx, is_off in enumerate(half_hour_flags):
-        if is_off and start_idx is None:
+    for idx, is_active in enumerate(half_hour_flags):
+        if is_active and start_idx is None:
             start_idx = idx
-        elif not is_off and start_idx is not None:
+        elif not is_active and start_idx is not None:
             intervals.append([_minutes_to_hhmm(start_idx * 30), _minutes_to_hhmm(idx * 30)])
             start_idx = None
 
@@ -233,13 +262,43 @@ def _extract_intervals_from_flags(half_hour_flags: list[bool]) -> list[list[str]
     return intervals
 
 
-def parse_group_slots(slots: dict[str, str]) -> tuple[list[list[str]], list[list[str]]]:
+def compute_day_breakdown(day: DaySchedule) -> tuple[list[list[str]], int, int, int]:
+    """
+    Обчислює інтервали, коли світло МАЄ БУТИ (гарантовано),
+    а також сумарні хвилини: (light_intervals, on_mins, off_mins, maybe_mins).
+    """
+    # 0 = світло є, 1 = відключення, 2 = можливе
+    slots = [0] * 48
+    for start_s, end_s in day.possible_intervals:
+        s_idx = _hhmm_to_minutes(start_s) // 30
+        e_idx = _hhmm_to_minutes(end_s) // 30
+        for i in range(max(0, s_idx), min(48, e_idx)):
+            slots[i] = 2
+
+    for start_s, end_s in day.intervals:
+        s_idx = _hhmm_to_minutes(start_s) // 30
+        e_idx = _hhmm_to_minutes(end_s) // 30
+        for i in range(max(0, s_idx), min(48, e_idx)):
+            slots[i] = 1
+
+    on_flags = [st == 0 for st in slots]
+    light_intervals = _extract_intervals_from_flags(on_flags)
+    on_mins = sum(1 for st in slots if st == 0) * 30
+    off_mins = sum(1 for st in slots if st == 1) * 30
+    maybe_mins = sum(1 for st in slots if st == 2) * 30
+    return light_intervals, on_mins, off_mins, maybe_mins
+
+
+def parse_group_slots(slots: dict[str, Any]) -> tuple[list[list[str]], list[list[str]]]:
     definite_off = [False] * 48
     possible_off = [False] * 48
 
-    for hour_num in range(1, 25):
-        val = str(slots.get(str(hour_num), "yes")).strip().lower()
-        base = (hour_num - 1) * 2
+    zero_based = ("0" in slots) and ("24" not in slots)
+
+    for hour_idx in range(24):
+        slot_key = str(hour_idx) if zero_based else str(hour_idx + 1)
+        val = str(slots.get(slot_key, "yes")).strip().lower()
+        base = hour_idx * 2
         if val == "no":
             definite_off[base] = True
             definite_off[base + 1] = True
@@ -261,44 +320,85 @@ def parse_group_slots(slots: dict[str, str]) -> tuple[list[list[str]], list[list
     )
 
 
+def _is_valid_fact_obj(obj: Any) -> bool:
+    if not isinstance(obj, dict):
+        return False
+    data = obj.get("data")
+    return isinstance(data, dict) and len(data) > 0
+
+
+def _parse_fact_day_key(raw_key: Any) -> Optional[date]:
+    text = clean_text(raw_key)
+    if not text:
+        return None
+    if re.fullmatch(r"\d+", text):
+        try:
+            ts = int(text)
+            if ts > 10**11:
+                ts //= 1000
+            # +3 год захищає від зсуву на 1 год при переході UTC/DST
+            return (datetime.fromtimestamp(ts, tz=KYIV_TZ) + timedelta(hours=3)).date()
+        except (ValueError, OSError, OverflowError):
+            return None
+
+    for fmt in ("%Y-%m-%d", "%d.%m.%Y", "%d.%m.%y"):
+        try:
+            return datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _build_group_candidates(group_ids: list[str]) -> list[str]:
+    candidates: list[str] = []
+    for raw in group_ids:
+        g = clean_text(raw)
+        if not g:
+            continue
+        variants = [g, g.upper()]
+        if g.upper().startswith("GPV"):
+            bare = g[3:].strip()
+            variants.extend([bare, f"GPV{bare}"])
+        else:
+            variants.append(f"GPV{g}")
+        for v in variants:
+            if v and v not in candidates:
+                candidates.append(v)
+    return candidates
+
+
 def extract_schedules_from_fact(
     fact_obj: dict[str, Any],
-    group_id: str,
+    group_ids: list[str],
 ) -> dict[str, DaySchedule]:
     result: dict[str, DaySchedule] = {}
-    if not fact_obj or not isinstance(fact_obj, dict) or not group_id:
+    if not _is_valid_fact_obj(fact_obj) or not group_ids:
         return result
 
-    fact_data = fact_obj.get("data")
-    if not isinstance(fact_data, dict):
-        return result
-
+    fact_data = fact_obj["data"]
     today_date = now_kyiv().date()
     tomorrow_date = today_date + timedelta(days=1)
-
-    candidate_keys = [group_id]
-    if group_id.startswith("GPV"):
-        candidate_keys.append(group_id.replace("GPV", "", 1))
-    else:
-        candidate_keys.append(f"GPV{group_id}")
+    candidates = _build_group_candidates(group_ids)
+    candidates_lower = {c.lower() for c in candidates}
 
     for ts_key, groups_map in fact_data.items():
         if not isinstance(groups_map, dict):
             continue
-        try:
-            day_dt = datetime.fromtimestamp(int(ts_key), tz=KYIV_TZ)
-        except (ValueError, TypeError, OSError):
-            continue
-
-        day_date = day_dt.date()
-        if day_date not in (today_date, tomorrow_date):
+        day_date = _parse_fact_day_key(ts_key)
+        if day_date is None or day_date not in (today_date, tomorrow_date):
             continue
 
         group_slots = None
-        for key in candidate_keys:
+        for key in candidates:
             if key in groups_map and isinstance(groups_map[key], dict):
                 group_slots = groups_map[key]
                 break
+
+        if group_slots is None:
+            for map_k, map_v in groups_map.items():
+                if clean_text(map_k).lower() in candidates_lower and isinstance(map_v, dict):
+                    group_slots = map_v
+                    break
 
         if not group_slots:
             continue
@@ -313,6 +413,46 @@ def extract_schedules_from_fact(
         )
 
     return result
+
+
+def extract_fact_from_html(page_html: str) -> Optional[dict[str, Any]]:
+    """Витягує JSON із `DisconSchedule.fact = {...}` напряму з HTML-коду сторінки."""
+    if not page_html:
+        return None
+    decoder = json.JSONDecoder()
+    for match in re.finditer(r"DisconSchedule\.fact\s*=\s*(\{)", page_html):
+        try:
+            obj, _ = decoder.raw_decode(page_html, match.start(1))
+            if _is_valid_fact_obj(obj):
+                return obj
+        except Exception:
+            continue
+    return None
+
+
+def fetch_mirror_fact() -> Optional[dict[str, Any]]:
+    """
+    Автоматичний резерв: завантажує актуальний fact для Дніпра з публічного дзеркала
+    Baskerville42/outage-data-ua (оновлюється кожні ~5 хв з того ж сайту ДТЕК).
+    """
+    try:
+        resp = requests.get(
+            f"{MIRROR_DNIPRO_URL}?t={int(time.time())}",
+            timeout=15,
+            headers={"User-Agent": "D10SvitloBot/1.1"},
+        )
+        if not resp.ok:
+            logger.warning("Резервне дзеркало повернуло HTTP %d", resp.status_code)
+            return None
+        payload = resp.json()
+        if isinstance(payload, dict):
+            if _is_valid_fact_obj(payload.get("fact")):
+                return payload["fact"]
+            if _is_valid_fact_obj(payload):
+                return payload
+    except Exception as exc:
+        logger.warning("Не вдалося завантажити резервне дзеркало dnipro.json: %s", exc)
+    return None
 
 
 # ==============================================================================
@@ -365,6 +505,7 @@ def fetch_dtek_snapshot() -> Optional[DtekSnapshot]:
 
                 page.goto(DTEK_SHUTDOWNS_URL, wait_until="domcontentloaded", timeout=60_000)
 
+                # Етап 1: чекаємо проходження Imperva та появи сторінки ДТЕК
                 page.wait_for_function(
                     """() => {
                         return Boolean(window.DisconSchedule) ||
@@ -373,7 +514,21 @@ def fetch_dtek_snapshot() -> Optional[DtekSnapshot]:
                     }""",
                     timeout=45_000,
                 )
-                page.wait_for_timeout(2000)
+
+                # Етап 2: даємо до 12 сек на виконання inline-скриптів DisconSchedule.fact
+                try:
+                    page.wait_for_function(
+                        """() => {
+                            const ds = window.DisconSchedule;
+                            return Boolean(ds && ds.fact && ds.fact.data && Object.keys(ds.fact.data).length > 0);
+                        }""",
+                        timeout=12_000,
+                    )
+                except Exception:
+                    logger.info("window.DisconSchedule.fact не встиг завантажитись за 12с — перевіримо AJAX, HTML та резерв.")
+
+                page.wait_for_timeout(1500)
+                page_html = page.content()
 
                 raw_payload = page.evaluate(
                     """async ({ city, street }) => {
@@ -383,8 +538,8 @@ def fetch_dtek_snapshot() -> Optional[DtekSnapshot]:
                         const ajaxUrl = ajaxMeta ? ajaxMeta.getAttribute('content') : '/ua/ajax';
 
                         const ds = window.DisconSchedule || {};
-                        const updateFact = (ds.fact && ds.fact.update) ? ds.fact.update : '';
 
+                        // Навмисно передаємо застарілу дату, щоб PHP-бекенд ДТЕК повернув свіжий блок fact
                         const params = new URLSearchParams();
                         params.append('method', 'getHomeNum');
                         params.append('data[0][name]', 'city');
@@ -392,7 +547,7 @@ def fetch_dtek_snapshot() -> Optional[DtekSnapshot]:
                         params.append('data[1][name]', 'street');
                         params.append('data[1][value]', street);
                         params.append('data[2][name]', 'updateFact');
-                        params.append('data[2][value]', updateFact);
+                        params.append('data[2][value]', '01.01.2000 00:00');
 
                         const headers = {
                             'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
@@ -429,7 +584,7 @@ def fetch_dtek_snapshot() -> Optional[DtekSnapshot]:
                 browser.close()
 
             ajax_resp = raw_payload.get("ajax") or {}
-            page_fact = raw_payload.get("fact") or {}
+            page_fact = raw_payload.get("fact")
 
             if not isinstance(ajax_resp, dict) or not ajax_resp.get("result"):
                 logger.warning("Некоректна відповідь getHomeNum: %s", str(ajax_resp)[:250])
@@ -440,7 +595,7 @@ def fetch_dtek_snapshot() -> Optional[DtekSnapshot]:
             house_entry = _find_house_entry(houses_data, DTEK_HOUSE)
             if house_entry is None:
                 logger.warning(
-                    "Будинок '%s' не знайдено серед повернутих (%d шт.). Перевірте точність адреси.",
+                    "Будинок '%s' не знайдено серед повернутих (%d шт.).",
                     DTEK_HOUSE,
                     len(houses_data) if isinstance(houses_data, dict) else 0,
                 )
@@ -450,44 +605,84 @@ def fetch_dtek_snapshot() -> Optional[DtekSnapshot]:
             start_date = clean_text(house_entry.get("start_date"))
             end_date = normalize_end_date_display(house_entry.get("end_date"))
             outage_type = clean_text(house_entry.get("type"))
-            update_ts = clean_text(
-                ajax_resp.get("updateTimestamp")
-                or (ajax_resp.get("fact") or {}).get("update")
-                or page_fact.get("update")
-            )
+            update_ts = clean_text(ajax_resp.get("updateTimestamp"))
 
             is_active = bool(sub_type or start_date or end_date)
+
+            reasons_raw = house_entry.get("sub_type_reason") or []
+            group_ids: list[str] = []
+            if isinstance(reasons_raw, list):
+                group_ids = [clean_text(x) for x in reasons_raw if clean_text(x)]
+            elif isinstance(reasons_raw, str) and clean_text(reasons_raw):
+                group_ids = [clean_text(reasons_raw)]
+
+            group_id = group_ids[0] if group_ids else ""
+
+            # 4-рівневий пошук валідного графіка ГПВ (ніколи не затираємо порожнім словником)
+            html_fact = extract_fact_from_html(page_html)
+            fact_sources: list[tuple[str, Optional[dict[str, Any]]]] = [
+                ("DTEK AJAX getHomeNum", ajax_resp.get("fact") if isinstance(ajax_resp.get("fact"), dict) else None),
+                ("DTEK window.DisconSchedule", page_fact if isinstance(page_fact, dict) else None),
+                ("DTEK HTML script", html_fact),
+            ]
+
+            schedules: dict[str, DaySchedule] = {}
+            chosen_fact_update = ""
+            chosen_source = ""
+
+            for src_name, candidate_fact in fact_sources:
+                if not _is_valid_fact_obj(candidate_fact):
+                    continue
+                extracted = extract_schedules_from_fact(candidate_fact, group_ids)
+                if extracted:
+                    schedules = extracted
+                    chosen_fact_update = clean_text(candidate_fact.get("update"))
+                    chosen_source = src_name
+                    break
+                else:
+                    sample_days = list(candidate_fact.get("data", {}).keys())[:3]
+                    logger.info(
+                        "Джерело '%s' має fact.data (%s), але не збіглось із групою %s.",
+                        src_name,
+                        sample_days,
+                        group_ids,
+                    )
+
+            # Рівень 4: резервне дзеркало dnipro.json, якщо сайт ДТЕК не віддав графік
+            if not schedules and group_ids:
+                logger.info("Пробуємо резервне джерело графіків (Baskerville42/outage-data-ua)...")
+                mirror_fact = fetch_mirror_fact()
+                if mirror_fact and _is_valid_fact_obj(mirror_fact):
+                    extracted = extract_schedules_from_fact(mirror_fact, group_ids)
+                    if extracted:
+                        schedules = extracted
+                        chosen_fact_update = clean_text(mirror_fact.get("update"))
+                        chosen_source = "Mirror dnipro.json"
+
+            fact_update = chosen_fact_update or update_ts
             banner = OutageBanner(
                 active=is_active,
                 reason=sub_type or "Відсутня електроенергія",
                 start_date=start_date,
                 end_date=end_date,
                 outage_type=outage_type,
-                update_timestamp=update_ts,
+                update_timestamp=update_ts or fact_update,
             )
 
-            reasons_list = house_entry.get("sub_type_reason") or []
-            group_id = ""
-            if isinstance(reasons_list, list) and reasons_list:
-                group_id = clean_text(reasons_list[0])
-            elif isinstance(reasons_list, str):
-                group_id = clean_text(reasons_list)
-
-            fact_obj = ajax_resp.get("fact") if isinstance(ajax_resp.get("fact"), dict) else page_fact
-            schedules = extract_schedules_from_fact(fact_obj or {}, group_id)
-            fact_update = clean_text((fact_obj or {}).get("update") or update_ts)
-
             logger.info(
-                "Успішно отримано дані: active=%s, group=%s, schedules=%s",
+                "Успішно отримано дані: active=%s, group=%s, schedules=%s, source=%s, fact_update=%s",
                 banner.active,
                 group_id or "не визначено",
                 list(schedules.keys()),
+                chosen_source or "немає",
+                fact_update or "-",
             )
             return DtekSnapshot(
                 group_id=group_id,
                 banner=banner,
                 schedules=schedules,
                 fact_update=fact_update,
+                schedule_source=chosen_source,
             )
 
         except Exception as exc:
@@ -653,14 +848,38 @@ def build_banner_resolved_message(prev: dict[str, Any], update_ts: str) -> str:
 
 
 def format_day_schedule_block(title: str, day: DaySchedule) -> str:
+    light_intervals, on_mins, off_mins, maybe_mins = compute_day_breakdown(day)
     lines = [f"{title} (<b>{day.date_label}</b>):"]
+
     if not day.intervals and not day.possible_intervals:
-        lines.append("🟢 <b>Відключень не заплановано</b> (00:00 — 24:00)")
+        lines.append("🟢 <b>Світло має бути весь день</b> (00:00 — 24:00)")
+        return "\n".join(lines)
+
+    # 1. Текстовий перелік, КОЛИ МАЄ БУТИ СВІТЛО
+    if light_intervals:
+        lines.append("🟢 <b>Світло має бути:</b>")
+        for start, end in light_intervals:
+            lines.append(f"  • <b>{start} — {end}</b>")
     else:
+        lines.append("🟢 <b>Світло має бути:</b> немає гарантованих вікон")
+
+    # 2. Періоди відключень (3-А)
+    if day.intervals:
+        lines.append("🪫 <b>Відключення:</b>")
         for start, end in day.intervals:
-            lines.append(f"🪫 <b>{start} — {end}</b>")
+            lines.append(f"  • {start} — {end}")
+
+    if day.possible_intervals:
+        lines.append("🟡 <b>Можливі відключення:</b>")
         for start, end in day.possible_intervals:
-            lines.append(f"🟡 {start} — {end} <i>(можливе відключення)</i>")
+            lines.append(f"  • {start} — {end}")
+
+    # 3. Підсумок годин
+    totals = [f"🟢 {format_duration_ua(on_mins)}", f"🪫 {format_duration_ua(off_mins)}"]
+    if maybe_mins > 0:
+        totals.append(f"🟡 {format_duration_ua(maybe_mins)}")
+    lines.append(f"📊 <i>Разом: {' / '.join(totals)}</i>")
+
     return "\n".join(lines)
 
 
@@ -694,7 +913,7 @@ def build_schedule_update_message(
 
     if snapshot.fact_update:
         lines.append("")
-        lines.append(f"<i>📢 Графік оновлено: {html.escape(snapshot.fact_update)}</i>")
+        lines.append(f"<i>📢 Графік оновлено ДТЕК: {html.escape(snapshot.fact_update)}</i>")
 
     return "\n".join(lines)
 
@@ -738,8 +957,9 @@ def check_pre_outage_warning(
                 return (
                     f"⏳ <b>Попередження: скоро планове відключення!</b>\n"
                     f"{format_address_line()}\n\n"
-                    f"Через <b>~{minutes_until} хв</b> (о <b>{start_str}</b>) очікується вимкнення світла за графіком.\n"
-                    f"🪫 Період: <b>{start_str} — {end_str}</b>\n\n"
+                    f"Через <b>~{minutes_until} хв</b> (о <b>{start_str}</b>) вимкнуть світло за графіком.\n"
+                    f"🪫 Період без світла: <b>{start_str} — {end_str}</b>\n"
+                    f"🟢 Світло має повернутись о <b>{end_str}</b>\n\n"
                     f"<i>💡 Встигніть зарядити пристрої та зберегти важливу роботу.</i>"
                 )
 
@@ -832,11 +1052,17 @@ def main() -> int:
             build_schedule_update_message(
                 snapshot=snapshot,
                 changed_dates=changed_dates,
-                is_initial=is_first_run,
+                is_initial=is_first_run or not bool(prev_schedules),
             )
         )
 
-    state["schedules"] = {k: v.to_dict() for k, v in snapshot.schedules.items()}
+    # Оновлюємо schedules у state.json, лише якщо графіки реально завантажились
+    if snapshot.schedules:
+        state["schedules"] = {k: v.to_dict() for k, v in snapshot.schedules.items()}
+        if snapshot.fact_update:
+            state["fact_update"] = snapshot.fact_update
+        if snapshot.schedule_source:
+            state["schedule_source"] = snapshot.schedule_source
 
     warning_msg = check_pre_outage_warning(snapshot, state)
     if warning_msg:
