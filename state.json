@@ -1,15 +1,13 @@
 {
   "banner": {
-    "active": true,
-    "reason": "Стабілізаційне відключення (Згідно графіку погодинних відключень)",
-    "start_date": "10:27 27.11.2026",
-    "end_date": "16:30 27.11.2026",
-    "outage_type": "2",
-    "update_timestamp": "15:48 27.11.2026"
+    "active": false,
+    "reason": "Відсутня електроенергія",
+    "start_date": "",
+    "end_date": "",
+    "outage_type": "",
+    "update_timestamp": "16:34 27.11.2026"
   },
-  "end_date_history": [
-    "16:30 27.11.2026"
-  ],
+  "end_date_history": [],
   "schedules": {
     "2026-11-27": {
       "date_iso": "2026-11-27",
@@ -31,7 +29,7 @@
       "possible_intervals": []
     }
   },
-  "last_successful_check": "2026-11-27T15:59:51.461533+02:00",
+  "last_successful_check": "2026-11-27T16:50:06.657954+02:00",
   "group_id": "GPV17.1",
   "notified_warnings": [],
   "fact_update": "27.11.2026 11:18",
