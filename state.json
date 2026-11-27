@@ -1,15 +1,39 @@
 {
   "banner": {
-    "active": false,
-    "reason": "Відсутня електроенергія",
-    "start_date": "",
-    "end_date": "",
-    "outage_type": "",
-    "update_timestamp": "11:51 27.11.2026"
+    "active": true,
+    "reason": "Стабілізаційне відключення (Згідно графіку погодинних відключень)",
+    "start_date": "10:27 27.11.2026",
+    "end_date": "16:30 27.11.2026",
+    "outage_type": "2",
+    "update_timestamp": "12:33 27.11.2026"
   },
-  "end_date_history": [],
-  "schedules": {},
-  "last_successful_check": "2026-11-27T11:55:23.609117+02:00",
+  "end_date_history": [
+    "16:30 27.11.2026"
+  ],
+  "schedules": {
+    "2026-11-27": {
+      "date_iso": "2026-11-27",
+      "date_label": "27.11.2026",
+      "intervals": [
+        [
+          "01:00",
+          "08:00"
+        ],
+        [
+          "10:00",
+          "16:30"
+        ],
+        [
+          "19:00",
+          "24:00"
+        ]
+      ],
+      "possible_intervals": []
+    }
+  },
+  "last_successful_check": "2026-11-27T12:43:45.423827+02:00",
   "group_id": "GPV17.1",
-  "notified_warnings": []
+  "notified_warnings": [],
+  "fact_update": "27.11.2026 11:18",
+  "schedule_source": "DTEK AJAX getHomeNum"
 }
