@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: '*/15 * * * *'
   workflow_dispatch:
+    inputs:
+      force_notify:
+        description: 'Примусово надіслати актуальний статус і графік у Telegram'
+        required: false
+        default: false
+        type: boolean
   repository_dispatch:
     types: [check-dtek]
 
@@ -65,6 +71,7 @@ jobs:
           DTEK_STREET: ${{ secrets.DTEK_STREET }}
           DTEK_HOUSE: ${{ secrets.DTEK_HOUSE }}
           STATE_FILE: state/state.json
+          FORCE_NOTIFY: ${{ github.event.inputs.force_notify || 'false' }}
           TUYA_API_REGION: ${{ secrets.TUYA_API_REGION }}
           TUYA_ACCESS_ID: ${{ secrets.TUYA_ACCESS_ID }}
           TUYA_ACCESS_SECRET: ${{ secrets.TUYA_ACCESS_SECRET }}
