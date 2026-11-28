@@ -1,13 +1,15 @@
 {
   "banner": {
-    "active": false,
-    "reason": "Відсутня електроенергія",
-    "start_date": "",
-    "end_date": "",
-    "outage_type": "",
-    "update_timestamp": "21:24 28.11.2026"
+    "active": true,
+    "reason": "Екстренні відключення (Аварійне без застосування графіку погодинних відключень)",
+    "start_date": "13:14 28.11.2026",
+    "end_date": "01:12 29.11.2026",
+    "outage_type": "2",
+    "update_timestamp": "22:19 28.11.2026"
   },
-  "end_date_history": [],
+  "end_date_history": [
+    "01:12 29.11.2026"
+  ],
   "schedules": {
     "2026-11-28": {
       "date_iso": "2026-11-28",
@@ -33,7 +35,7 @@
       "possible_intervals": []
     }
   },
-  "last_successful_check": "2026-11-28T21:35:27.060668+02:00",
+  "last_successful_check": "2026-11-28T22:28:53.776456+02:00",
   "group_id": "GPV17.1",
   "notified_warnings": [
     "2026-11-28 00:00",
