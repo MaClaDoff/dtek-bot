@@ -5,7 +5,7 @@
     "start_date": "13:14 28.11.2026",
     "end_date": "17:12 28.11.2026",
     "outage_type": "2",
-    "update_timestamp": "15:21 28.11.2026"
+    "update_timestamp": "16:18 28.11.2026"
   },
   "end_date_history": [
     "17:12 28.11.2026"
@@ -35,7 +35,7 @@
       "possible_intervals": []
     }
   },
-  "last_successful_check": "2026-11-28T15:31:36.931797+02:00",
+  "last_successful_check": "2026-11-28T16:27:48.044336+02:00",
   "group_id": "GPV17.1",
   "notified_warnings": [
     "2026-11-28 00:00",
